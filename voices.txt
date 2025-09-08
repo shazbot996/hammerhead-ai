@@ -1,0 +1,415 @@
+--- Available TTS Voices ---
+
+--- Voice Index: 0 ---
+  ID: afrikaans
+  Name: afrikaans
+  Languages: [b'\x05af']
+  Gender: male
+
+--- Voice Index: 1 ---
+  ID: aragonese
+  Name: aragonese
+  Languages: [b'\x05an']
+  Gender: male
+
+--- Voice Index: 2 ---
+  ID: bulgarian
+  Name: bulgarian
+  Languages: [b'\x05bg']
+  Gender: None
+
+--- Voice Index: 3 ---
+  ID: bosnian
+  Name: bosnian
+  Languages: [b'\x05bs']
+  Gender: male
+
+--- Voice Index: 4 ---
+  ID: catalan
+  Name: catalan
+  Languages: [b'\x05ca']
+  Gender: male
+
+--- Voice Index: 5 ---
+  ID: czech
+  Name: czech
+  Languages: [b'\x05cs']
+  Gender: male
+
+--- Voice Index: 6 ---
+  ID: welsh
+  Name: welsh
+  Languages: [b'\x05cy']
+  Gender: male
+
+--- Voice Index: 7 ---
+  ID: danish
+  Name: danish
+  Languages: [b'\x05da']
+  Gender: male
+
+--- Voice Index: 8 ---
+  ID: german
+  Name: german
+  Languages: [b'\x05de']
+  Gender: male
+
+--- Voice Index: 9 ---
+  ID: greek
+  Name: greek
+  Languages: [b'\x05el']
+  Gender: male
+
+--- Voice Index: 10 ---
+  ID: default
+  Name: default
+  Languages: [b'\x05en']
+  Gender: male
+
+--- Voice Index: 11 ---
+  ID: english
+  Name: english
+  Languages: [b'\x02en-gb']
+  Gender: male
+
+--- Voice Index: 12 ---
+  ID: en-scottish
+  Name: en-scottish
+  Languages: [b'\x05en-sc']
+  Gender: male
+
+--- Voice Index: 13 ---
+  ID: english-north
+  Name: english-north
+  Languages: [b'\x05en-uk-north']
+  Gender: male
+
+--- Voice Index: 14 ---
+  ID: english_rp
+  Name: english_rp
+  Languages: [b'\x05en-uk-rp']
+  Gender: male
+
+--- Voice Index: 15 ---
+  ID: english_wmids
+  Name: english_wmids
+  Languages: [b'\x05en-uk-wmids']
+  Gender: male
+
+--- Voice Index: 16 ---
+  ID: english-us
+  Name: english-us
+  Languages: [b'\x02en-us']
+  Gender: male
+
+--- Voice Index: 17 ---
+  ID: en-westindies
+  Name: en-westindies
+  Languages: [b'\x05en-wi']
+  Gender: male
+
+--- Voice Index: 18 ---
+  ID: esperanto
+  Name: esperanto
+  Languages: [b'\x05eo']
+  Gender: male
+
+--- Voice Index: 19 ---
+  ID: spanish
+  Name: spanish
+  Languages: [b'\x05es']
+  Gender: male
+
+--- Voice Index: 20 ---
+  ID: spanish-latin-am
+  Name: spanish-latin-am
+  Languages: [b'\x05es-la']
+  Gender: male
+
+--- Voice Index: 21 ---
+  ID: estonian
+  Name: estonian
+  Languages: [b'\x05et']
+  Gender: None
+
+--- Voice Index: 22 ---
+  ID: persian
+  Name: persian
+  Languages: [b'\x05fa']
+  Gender: None
+
+--- Voice Index: 23 ---
+  ID: persian-pinglish
+  Name: persian-pinglish
+  Languages: [b'\x05fa-pin']
+  Gender: None
+
+--- Voice Index: 24 ---
+  ID: finnish
+  Name: finnish
+  Languages: [b'\x05fi']
+  Gender: male
+
+--- Voice Index: 25 ---
+  ID: french-Belgium
+  Name: french-Belgium
+  Languages: [b'\x05fr-be']
+  Gender: male
+
+--- Voice Index: 26 ---
+  ID: french
+  Name: french
+  Languages: [b'\x05fr-fr']
+  Gender: male
+
+--- Voice Index: 27 ---
+  ID: irish-gaeilge
+  Name: irish-gaeilge
+  Languages: [b'\x05ga']
+  Gender: None
+
+--- Voice Index: 28 ---
+  ID: greek-ancient
+  Name: greek-ancient
+  Languages: [b'\x05grc']
+  Gender: male
+
+--- Voice Index: 29 ---
+  ID: hindi
+  Name: hindi
+  Languages: [b'\x05hi']
+  Gender: male
+
+--- Voice Index: 30 ---
+  ID: croatian
+  Name: croatian
+  Languages: [b'\x05hr']
+  Gender: male
+
+--- Voice Index: 31 ---
+  ID: hungarian
+  Name: hungarian
+  Languages: [b'\x05hu']
+  Gender: male
+
+--- Voice Index: 32 ---
+  ID: armenian
+  Name: armenian
+  Languages: [b'\x05hy']
+  Gender: male
+
+--- Voice Index: 33 ---
+  ID: armenian-west
+  Name: armenian-west
+  Languages: [b'\x05hy-west']
+  Gender: male
+
+--- Voice Index: 34 ---
+  ID: indonesian
+  Name: indonesian
+  Languages: [b'\x05id']
+  Gender: male
+
+--- Voice Index: 35 ---
+  ID: icelandic
+  Name: icelandic
+  Languages: [b'\x05is']
+  Gender: male
+
+--- Voice Index: 36 ---
+  ID: italian
+  Name: italian
+  Languages: [b'\x05it']
+  Gender: male
+
+--- Voice Index: 37 ---
+  ID: lojban
+  Name: lojban
+  Languages: [b'\x05jbo']
+  Gender: None
+
+--- Voice Index: 38 ---
+  ID: georgian
+  Name: georgian
+  Languages: [b'\x05ka']
+  Gender: None
+
+--- Voice Index: 39 ---
+  ID: kannada
+  Name: kannada
+  Languages: [b'\x05kn']
+  Gender: None
+
+--- Voice Index: 40 ---
+  ID: kurdish
+  Name: kurdish
+  Languages: [b'\x05ku']
+  Gender: male
+
+--- Voice Index: 41 ---
+  ID: latin
+  Name: latin
+  Languages: [b'\x05la']
+  Gender: male
+
+--- Voice Index: 42 ---
+  ID: lingua_franca_nova
+  Name: lingua_franca_nova
+  Languages: [b'\x05lfn']
+  Gender: male
+
+--- Voice Index: 43 ---
+  ID: lithuanian
+  Name: lithuanian
+  Languages: [b'\x05lt']
+  Gender: male
+
+--- Voice Index: 44 ---
+  ID: latvian
+  Name: latvian
+  Languages: [b'\x05lv']
+  Gender: male
+
+--- Voice Index: 45 ---
+  ID: macedonian
+  Name: macedonian
+  Languages: [b'\x05mk']
+  Gender: male
+
+--- Voice Index: 46 ---
+  ID: malayalam
+  Name: malayalam
+  Languages: [b'\x05ml']
+  Gender: male
+
+--- Voice Index: 47 ---
+  ID: malay
+  Name: malay
+  Languages: [b'\x05ms']
+  Gender: male
+
+--- Voice Index: 48 ---
+  ID: nepali
+  Name: nepali
+  Languages: [b'\x05ne']
+  Gender: male
+
+--- Voice Index: 49 ---
+  ID: dutch
+  Name: dutch
+  Languages: [b'\x05nl']
+  Gender: male
+
+--- Voice Index: 50 ---
+  ID: norwegian
+  Name: norwegian
+  Languages: [b'\x05no']
+  Gender: male
+
+--- Voice Index: 51 ---
+  ID: punjabi
+  Name: punjabi
+  Languages: [b'\x05pa']
+  Gender: None
+
+--- Voice Index: 52 ---
+  ID: polish
+  Name: polish
+  Languages: [b'\x05pl']
+  Gender: male
+
+--- Voice Index: 53 ---
+  ID: brazil
+  Name: brazil
+  Languages: [b'\x05pt-br']
+  Gender: male
+
+--- Voice Index: 54 ---
+  ID: portugal
+  Name: portugal
+  Languages: [b'\x05pt-pt']
+  Gender: male
+
+--- Voice Index: 55 ---
+  ID: romanian
+  Name: romanian
+  Languages: [b'\x05ro']
+  Gender: male
+
+--- Voice Index: 56 ---
+  ID: russian
+  Name: russian
+  Languages: [b'\x05ru']
+  Gender: male
+
+--- Voice Index: 57 ---
+  ID: slovak
+  Name: slovak
+  Languages: [b'\x05sk']
+  Gender: male
+
+--- Voice Index: 58 ---
+  ID: albanian
+  Name: albanian
+  Languages: [b'\x05sq']
+  Gender: male
+
+--- Voice Index: 59 ---
+  ID: serbian
+  Name: serbian
+  Languages: [b'\x05sr']
+  Gender: male
+
+--- Voice Index: 60 ---
+  ID: swedish
+  Name: swedish
+  Languages: [b'\x05sv']
+  Gender: male
+
+--- Voice Index: 61 ---
+  ID: swahili-test
+  Name: swahili-test
+  Languages: [b'\x05sw']
+  Gender: male
+
+--- Voice Index: 62 ---
+  ID: tamil
+  Name: tamil
+  Languages: [b'\x05ta']
+  Gender: male
+
+--- Voice Index: 63 ---
+  ID: turkish
+  Name: turkish
+  Languages: [b'\x05tr']
+  Gender: male
+
+--- Voice Index: 64 ---
+  ID: vietnam
+  Name: vietnam
+  Languages: [b'\x05vi']
+  Gender: male
+
+--- Voice Index: 65 ---
+  ID: vietnam_hue
+  Name: vietnam_hue
+  Languages: [b'\x05vi-hue']
+  Gender: male
+
+--- Voice Index: 66 ---
+  ID: vietnam_sgn
+  Name: vietnam_sgn
+  Languages: [b'\x05vi-sgn']
+  Gender: male
+
+--- Voice Index: 67 ---
+  ID: Mandarin
+  Name: Mandarin
+  Languages: [b'\x05zh']
+  Gender: male
+
+--- Voice Index: 68 ---
+  ID: cantonese
+  Name: cantonese
+  Languages: [b'\x05zh-yue']
+  Gender: male
