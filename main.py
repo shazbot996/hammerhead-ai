@@ -375,6 +375,21 @@ def main():
                 print("ERROR: Cannot run test, TTS client failed to initialize.")
             return # Exit after the test
 
+        # --- Play Startup Greeting ---
+        startup_greeting = config_data.get("startup_greeting")
+        if startup_greeting and tts_client:
+            print(f"\n--- Playing Startup Greeting ---")
+            print(f"Message: '{startup_greeting}'")
+            # We can use the same threaded player.
+            # We don't need to join this thread, as it can play in the background
+            # while the camera initializes.
+            startup_audio_thread = threading.Thread(
+                target=_play_audio_threaded,
+                args=(startup_greeting, config_data, tts_client)
+            )
+            startup_audio_thread.daemon = True
+            startup_audio_thread.start()
+
         # Initialize video capture
         print("Initializing camera...")
         camera_index = find_camera_index()
