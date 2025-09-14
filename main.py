@@ -10,6 +10,7 @@ import face_recognition
 import numpy as np
 import pyttsx3
 import subprocess
+import netconfig
 try:
     from pycoral.adapters import common
     from pycoral.adapters import detect
@@ -419,7 +420,7 @@ def sync_data_from_removable_media(local_cache_path):
     MOUNT_POINT = "/mnt/sdcard"
     source_dir_name = "hammerhead_data"
 
-    print("\n--- Attempting to sync data from SD card... ---")
+    print("\n--- Attempting to sync local configuration and data from SD card... ---")
 
     # 1. Check if the SD card device file exists before trying to mount.
     if not os.path.exists(SD_CARD_DEVICE):
@@ -431,8 +432,10 @@ def sync_data_from_removable_media(local_cache_path):
         # 2. Create the mount point directory if it doesn't exist.
         os.makedirs(MOUNT_POINT, exist_ok=True)
 
-        # 3. Mount the device using sudo.
+        # 3. Mount the device. This requires passwordless sudo for the 'mount' command.
         print(f"Mounting {SD_CARD_DEVICE} to {MOUNT_POINT}...")
+        # The mount command is kept simple to support various filesystems (e.g., ext4).
+        # We will handle permissions during the copy stage.
         subprocess.run(
             ['sudo', 'mount', SD_CARD_DEVICE, MOUNT_POINT],
             check=True, stderr=subprocess.PIPE
@@ -440,15 +443,34 @@ def sync_data_from_removable_media(local_cache_path):
         is_mounted = True
         print("Mount successful.")
 
+        # --- Check for and apply network configuration from SD card ---
+        # This is done while the card is mounted, before syncing other data.
+        # It requires the main script to be run with sudo.
+        netconfig.check_and_configure_wifi()
+
         # 4. Perform the sync if the source directory exists.
         sd_source_path = os.path.join(MOUNT_POINT, source_dir_name)
         if os.path.isdir(sd_source_path):
             print(f"Found update data at: '{sd_source_path}'")
             print(f"Syncing contents to local cache: '{local_cache_path}'")
+            # We use 'sudo cp' because the mounted files will likely be owned by root.
+            # This requires passwordless sudo for the 'cp' command.
             subprocess.run(
-                ['cp', '-arT', sd_source_path, local_cache_path],
+                ['sudo', 'cp', '-arT', sd_source_path, local_cache_path],
                 check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
             )
+
+            # After copying with sudo, the new files in the cache are owned by root.
+            # We must change ownership back to the current user ('mendel') so the
+            # application can read and write to its own cache.
+            # This requires passwordless sudo for the 'chown' command.
+            uid, gid = os.getuid(), os.getgid()
+            print(f"Resetting ownership of '{local_cache_path}' to user {uid}...")
+            subprocess.run(
+                ['sudo', 'chown', '-R', f'{uid}:{gid}', local_cache_path],
+                check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
+            )
+
             print("--- Sync complete. ---")
             print("The application will now check for updated face images and re-index if necessary.")
         else:
