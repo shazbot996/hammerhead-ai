@@ -59,28 +59,27 @@ def load_data():
 def index_faces():
     """
     Loads face encodings from a cache file if it's valid, otherwise creates
-    them from images and saves them to the cache. The cache is considered
-    invalid if the set of image filenames has changed.
+    them from images and saves them to the cache. The cache is considered invalid
+    if the list of image filenames has changed.
     """
     cache_path = os.path.join(LOCAL_CACHE_DIR, "face_encodings.pkl")
 
-    # Get the current list of image files to validate against the cache
+    # --- 1. Get the current list of image files to validate the cache ---
     try:
         current_image_files = sorted([
-            f for f in os.listdir(LOCAL_FACES_DIR)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+            f for f in os.listdir(LOCAL_FACES_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))
         ])
     except FileNotFoundError:
         print(f"ERROR: Local faces directory not found: {LOCAL_FACES_DIR}")
         return [], []
 
-    # --- 1. Try to load from cache and validate it ---
+    # --- 2. Try to load from cache and validate it ---
     if os.path.exists(cache_path):
-        print("Loading face encodings from cache...")
+        print("Validating face-index cache by checking filenames...")
         try:
             with open(cache_path, 'rb') as f:
                 cached_data = pickle.load(f)
-            # Validate cache by comparing file lists
+            # Validate cache by comparing file lists. Using sets is a robust way to compare.
             if set(cached_data.get('filenames', [])) == set(current_image_files):
                 print("Cache is valid. Loading encodings from cache.")
                 known_face_encodings = cached_data['encodings']
@@ -88,37 +87,44 @@ def index_faces():
                 print(f"Cache loaded. Found {len(known_face_encodings)} indexed faces.")
                 return known_face_encodings, known_face_names
             else:
-                print("Cache is stale (image files have changed). Re-indexing...")
+                print("Cache is stale (image file list has changed). Re-indexing...")
         except Exception as e:
             print(f"Warning: Could not load or validate cache file ({e}). Re-indexing from images.")
 
-    # --- 2. If cache fails or doesn't exist, index from images ---
+    # --- 3. If cache is invalid or doesn't exist, index from images ---
     print("Indexing faces from image files...")
+    if not current_image_files:
+        print("No image files found in face-index directory.")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            print("Removed old cache file.")
+        return [], []
+
     known_face_encodings = []
     known_face_names = []
-    processed_filenames = []
-
     for filename in current_image_files:
         path = os.path.join(LOCAL_FACES_DIR, filename)
         name = re.split(r'[-\d._]', os.path.splitext(filename)[0])[0]
         if not name:
             print(f"Could not parse name from filename: {filename}. Skipping.")
             continue
+
         print(f"Processing {filename} for person: {name}")
         image = face_recognition.load_image_file(path)
         encodings = face_recognition.face_encodings(image)
+
         if encodings:
             known_face_encodings.append(encodings[0])
             known_face_names.append(name)
-            processed_filenames.append(filename)
         else:
             print(f"Warning: No face found in {filename}. Skipping.")
-    # --- 3. Save the newly generated encodings and file list to the cache ---
+
+    # --- 4. Save the newly generated encodings and file list to the cache ---
     if known_face_encodings:
         print(f"Face indexing complete. Found {len(known_face_encodings)} face(s).")
         print(f"Saving new encodings to cache file: {cache_path}")
         cache_data = {
-            'filenames': processed_filenames,
+            'filenames': current_image_files,
             'encodings': known_face_encodings,
             'names': known_face_names
         }
@@ -322,7 +328,9 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         crop_right = min(frame_width, right + x_buffer)
 
         # Create the cropped image of the face
-        face_image = rgb_frame[crop_top:crop_bottom, crop_left:crop_right]
+        # A copy is made to ensure the numpy array is C-contiguous in memory,
+        # which is required by the underlying dlib library.
+        face_image = rgb_frame[crop_top:crop_bottom, crop_left:crop_right].copy()
 
         # --- Add a size filter to reject tiny detections ---
         crop_height, crop_width, _ = face_image.shape
@@ -401,6 +409,62 @@ def find_camera_index():
         cap.release()
     return -1 # Return -1 if no camera is found
 
+def sync_data_from_removable_media(local_cache_path):
+    """
+    Mounts an SD card, syncs data, and unmounts it. This provides a
+    controlled, offline method for updating configuration and face images.
+    NOTE: This function requires the script to be run with sudo.
+    """
+    SD_CARD_DEVICE = "/dev/mmcblk1p1"  # From your lsblk output
+    MOUNT_POINT = "/mnt/sdcard"
+    source_dir_name = "hammerhead_data"
+
+    print("\n--- Attempting to sync data from SD card... ---")
+
+    # 1. Check if the SD card device file exists before trying to mount.
+    if not os.path.exists(SD_CARD_DEVICE):
+        print(f"Info: SD card device ({SD_CARD_DEVICE}) not found. Skipping sync.")
+        return
+
+    is_mounted = False
+    try:
+        # 2. Create the mount point directory if it doesn't exist.
+        os.makedirs(MOUNT_POINT, exist_ok=True)
+
+        # 3. Mount the device using sudo.
+        print(f"Mounting {SD_CARD_DEVICE} to {MOUNT_POINT}...")
+        subprocess.run(
+            ['sudo', 'mount', SD_CARD_DEVICE, MOUNT_POINT],
+            check=True, stderr=subprocess.PIPE
+        )
+        is_mounted = True
+        print("Mount successful.")
+
+        # 4. Perform the sync if the source directory exists.
+        sd_source_path = os.path.join(MOUNT_POINT, source_dir_name)
+        if os.path.isdir(sd_source_path):
+            print(f"Found update data at: '{sd_source_path}'")
+            print(f"Syncing contents to local cache: '{local_cache_path}'")
+            subprocess.run(
+                ['cp', '-arT', sd_source_path, local_cache_path],
+                check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
+            )
+            print("--- Sync complete. ---")
+            print("The application will now check for updated face images and re-index if necessary.")
+        else:
+            print(f"Info: Mounted SD card, but did not find '{source_dir_name}' directory.")
+
+    except subprocess.CalledProcessError as e:
+        command = " ".join(e.cmd)
+        print(f"ERROR: Command '{command}' failed. Stderr: {e.stderr.decode().strip()}")
+    except Exception as e:
+        print(f"An unexpected error occurred during SD card sync: {e}")
+    finally:
+        # 5. Unmount the device, but only if we successfully mounted it.
+        if is_mounted:
+            print(f"Unmounting {MOUNT_POINT}...")
+            subprocess.run(['sudo', 'umount', MOUNT_POINT], check=False) # Use check=False to avoid crashing on unmount error
+        print("--- Finished SD card sync process. ---")
 
 # --- 6. Main Orchestrator ---
 def main():
@@ -414,6 +478,11 @@ def main():
 
     # --- Initialization ---
     try:
+        # First, attempt to sync data from an SD card BEFORE loading anything.
+        # This allows the SD card to provide the initial config.json if needed.
+        sync_data_from_removable_media(LOCAL_CACHE_DIR)
+
+
         config_data = load_data()
         if not config_data:
             return  # Exit if config loading failed

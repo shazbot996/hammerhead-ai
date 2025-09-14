@@ -1,0 +1,15 @@
+# Set the default behavior for all text files.
+# Git will normalize line endings to LF in the repository and convert them
+# to the OS-native line endings on checkout (CRLF on Windows, LF on Linux).
+* text=auto
+
+# Explicitly force LF line endings for files that must be run on Linux.
+# This overrides the 'auto' setting and prevents CRLF conversion on Windows.
+*.sh    eol=lf
+*.py    eol=lf
+
+# Declare files that should be treated as binary and not have their line endings changed.
+*.jpg   binary
+*.png   binary
+*.pkl   binary
+*.tflite binary

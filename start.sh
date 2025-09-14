@@ -17,5 +17,5 @@ echo "Starting Hammerhead AI application..."
 # compatible across different versions. This allows us to use a modern protobuf
 # version required by google-cloud-* packages while still running the older code.
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-
+ 
 DISPLAY=:0 python3 main.py
