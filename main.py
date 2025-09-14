@@ -11,6 +11,12 @@ import numpy as np
 import pyttsx3
 import subprocess
 try:
+    from pycoral.adapters import common
+    from pycoral.adapters import detect
+    from pycoral.utils.edgetpu import make_interpreter
+except ImportError:
+    print("Warning: PyCoral library not found. Edge TPU acceleration will be disabled.")
+try:
     from google.cloud import texttospeech
 except ImportError:
     print("Warning: Google Cloud TextToSpeech library not found. Google TTS will not be available.")
@@ -22,8 +28,6 @@ LOCAL_CACHE_DIR = "local_data_cache"
 LOCAL_FACES_DIR = os.path.join(LOCAL_CACHE_DIR, "face-index")
 LOCAL_CONFIG_DIR = os.path.join(LOCAL_CACHE_DIR, "config")
 
-# Cooldown in seconds to prevent spamming responses for the same person
-RESPONSE_COOLDOWN = 60  # 1 minute
 TEMP_AUDIO_FILE_PREFIX = "temp_response" # Used for thread-safe filenames
 
 # --- 1. Load Local Data ---
@@ -131,7 +135,7 @@ def _play_audio_threaded(response_text, config_data, tts_client):
     This function runs in a separate thread to play audio without blocking the main loop.
     It contains the actual blocking TTS logic.
     """
-    print(f"DEBUG (Thread): Attempting to use '{config_data.get('tts_engine', 'pyttsx3')}' engine.")
+    #print(f"DEBUG (Thread): Attempting to use '{config_data.get('tts_engine', 'pyttsx3')}' engine.")
     tts_engine_choice = config_data.get("tts_engine", "pyttsx3")
     temp_file = f"{TEMP_AUDIO_FILE_PREFIX}-{threading.get_ident()}.wav" # Use WAV format for better compatibility
     try:
@@ -149,7 +153,6 @@ def _play_audio_threaded(response_text, config_data, tts_client):
                 sample_rate_hertz=tts_config.get("sample_rate_hertz", 22050), # Specify sample rate for WAV
                 pitch=tts_config.get("pitch", 0.0)
             )
-            print(f"DEBUG (Thread): Synthesizing speech with Google Cloud using config: {tts_config}")
             response = tts_client.synthesize_speech(
                 input=synthesis_input, voice=voice, audio_config=audio_config
             )
@@ -165,7 +168,7 @@ def _play_audio_threaded(response_text, config_data, tts_client):
 
             # --- Play the WAV file using aplay, the standard Linux audio player ---
             try:
-                print(f"DEBUG (Thread): Playing {temp_file} with aplay...")
+                #print(f"DEBUG (Thread): Playing {temp_file} with aplay...")
                 subprocess.run(
                     ['aplay', '-q', temp_file], # The '-q' flag makes it quiet
                     check=True,
@@ -195,17 +198,10 @@ def _play_audio_threaded(response_text, config_data, tts_client):
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-def play_response(name, config_data, tts_client, last_played_times):
+def play_response(name, config_data, tts_client):
     """
     Looks up a response and starts a new thread to play it using text-to-speech.
-    Includes a cooldown to prevent spam.
     """
-    current_time = time.time()
-
-    # Check cooldown
-    if name in last_played_times and (current_time - last_played_times[name]) < RESPONSE_COOLDOWN:
-        return
-
     # Look for responses within the 'responses' key of the config data
     responses = config_data.get("responses", {})
     response_text = responses.get(name, responses.get("unknown"))
@@ -215,9 +211,6 @@ def play_response(name, config_data, tts_client, last_played_times):
 
     print(f"Recognized {name}. Playing response: '{response_text}'")
 
-    # Update cooldown time immediately to prevent re-triggering while audio plays
-    last_played_times[name] = current_time
-
     # Create and start a new thread for audio playback to avoid blocking the video loop
     audio_thread = threading.Thread(
         target=_play_audio_threaded,
@@ -226,19 +219,18 @@ def play_response(name, config_data, tts_client, last_played_times):
     audio_thread.daemon = True  # Allows main program to exit even if thread is running
     audio_thread.start()
 # --- 4. Process Frame ---
-def process_frame(frame, known_face_encodings, known_face_names):
+def process_frame_cpu(frame, known_face_encodings, known_face_names):
     """
-    Detects and recognizes faces in a single video frame.
-
-    NOTE: This function uses face_recognition's built-in HOG-based detector.
-    For better performance on a Coral Dev Board, this should be replaced with
-    a PyCoral-accelerated face *detection* model. The detected face bounding
-    boxes would then be passed to face_recognition for *encoding* and comparison.
+    (CPU Fallback) Detects and recognizes faces using only the CPU.
+    This is slow and should only be used if the Edge TPU fails.
     """
     # Resize frame for faster processing
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+    # This is the slow, CPU-intensive part
+    print("DEBUG: Using CPU for face detection...")
 
     # Find all the faces and face encodings in the current frame of video
     face_locations = face_recognition.face_locations(rgb_small_frame)
@@ -273,6 +265,120 @@ def process_frame(frame, known_face_encodings, known_face_names):
 
         # Draw a label with a name below the face
         cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
+        font = cv2.FONT_HERSHEY_DUPLEX
+        cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
+
+    return recognized_names, frame
+
+def process_frame(frame, known_face_encodings, known_face_names, interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage):
+    """
+    Detects faces using the Edge TPU and recognizes them using the CPU.
+    This is the primary, high-performance processing function.
+    """
+    # --- Stage 1: Face Detection on the Edge TPU ---
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_height, frame_width, _ = frame.shape
+    _, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
+
+    # Resize image to the expected input shape of the TPU model
+    resized_image = cv2.resize(rgb_frame, (input_width, input_height))
+
+    # Run inference on the Edge TPU
+    common.set_input(interpreter, resized_image)
+    interpreter.invoke()
+    detected_objects = detect.get_objects(interpreter, detection_threshold, (1.0, 1.0))
+
+    recognized_names = []     # Names of successfully recognized faces
+    successful_locations = [] # Bboxes for successful encodings
+    failed_locations = []     # Bboxes for failed encodings
+
+    # --- Stage 2: Face Recognition on the CPU for each detected face ---
+    for obj in detected_objects:
+        # Get bounding box and scale it to the original frame's dimensions
+        bbox = obj.bbox
+        top = int(bbox.ymin * frame_height)
+        left = int(bbox.xmin * frame_width)
+        bottom = int(bbox.ymax * frame_height)
+        right = int(bbox.xmax * frame_width)
+
+        # --- Filter based on face size relative to frame height ---
+        # This is the primary filter to only process faces that are close to the camera.
+        bbox_height = bottom - top
+        height_percentage = bbox_height / frame_height
+        if height_percentage < min_face_height_percentage:
+            # This face is too far away, ignore it completely.
+            # print(f"DEBUG: Ignoring face, height {height_percentage:.2f} is less than threshold {min_face_height_percentage:.2f}")
+            continue
+
+        # --- OPTIMIZATION: Crop the face before recognition ---
+        # This is the key to performance. We pass a small, cropped image to the
+        # face_recognition library instead of the entire frame.
+
+        # Add a small buffer to the bounding box to ensure the whole face is captured
+        y_buffer = int((bottom - top) * 0.15)
+        x_buffer = int((right - left) * 0.15)
+        crop_top = max(0, top - y_buffer)
+        crop_bottom = min(frame_height, bottom + y_buffer)
+        crop_left = max(0, left - x_buffer)
+        crop_right = min(frame_width, right + x_buffer)
+
+        # Create the cropped image of the face
+        face_image = rgb_frame[crop_top:crop_bottom, crop_left:crop_right]
+
+        # --- Add a size filter to reject tiny detections ---
+        crop_height, crop_width, _ = face_image.shape
+        MIN_CROP_SIZE = 40 # Minimum pixel dimension for a crop to be considered
+        if crop_width < MIN_CROP_SIZE or crop_height < MIN_CROP_SIZE:
+            # This crop is too small to be reliably identified. Skip it.
+            # The yellow box drawn later will indicate this was a failed detection.
+            failed_locations.append((top, right, bottom, left))
+            continue
+
+        # Now, run recognition on the SMALL, CROPPED face image. This is much faster.
+        # We pass `None` for locations because the library will find the single face in our crop.
+        face_encodings = face_recognition.face_encodings(face_image) if face_image.size > 0 else []
+
+        if face_encodings:
+            name = "unknown"
+            # We have an encoding, now compare it to our known faces
+            face_encoding = face_encodings[0]
+
+            # --- Compare face encoding to known faces ---
+            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+
+            if len(face_distances) > 0:
+                best_match_index = np.argmin(face_distances)
+                best_match_distance = face_distances[best_match_index]
+
+                # Print the distance for debugging. This is very helpful for tuning!
+                print(f"DEBUG: Closest match distance: {best_match_distance:.4f} (Threshold: {recognition_tolerance})")
+
+                # Check if the best match is within the tolerance
+                if best_match_distance <= recognition_tolerance:
+                    name = known_face_names[best_match_index]
+            
+            recognized_names.append(name)
+            successful_locations.append((top, right, bottom, left))
+        else:
+            # This is useful for debugging false positives from the TPU detector.
+            print(f"DEBUG: TPU detected an object, but face_recognition could not generate an encoding from it. Crop size: {crop_width}x{crop_height}")
+            failed_locations.append((top, right, bottom, left))
+
+    # --- For visualization ---
+    # Draw YELLOW boxes for detections that failed the encoding/size check
+    for (top, right, bottom, left) in failed_locations:
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 255), 2) # Yellow
+        font = cv2.FONT_HERSHEY_DUPLEX
+        # Optionally, add text to the failed boxes
+        # cv2.putText(frame, 'detect_fail', (left + 6, bottom - 6), font, 0.5, (0, 0, 0), 1)
+
+    # Draw GREEN boxes for successful recognitions (known or unknown)
+    for (top, right, bottom, left), name in zip(successful_locations, recognized_names):
+        # Draw a box around the face
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+
+        # Draw a label with a name below the face
+        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
         font = cv2.FONT_HERSHEY_DUPLEX
         cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
 
@@ -317,6 +423,27 @@ def main():
         if not known_face_encodings:
             print(f"No faces were indexed. Please check the '{LOCAL_FACES_DIR}' directory.")
             return
+
+        # --- Initialize Edge TPU Face Detector ---
+        tpu_model_path = config_data.get("tpu_model_path", "models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite")
+        detection_threshold = config_data.get("tpu_detection_threshold", 0.6)
+        recognition_tolerance = config_data.get("recognition_tolerance", 0.6)
+        min_face_height_percentage = config_data.get("min_face_height_percentage", 0.25) # e.g., 0.25 means face must be 25% of frame height
+        tpu_interpreter = None
+        print("Initializing Edge TPU for face detection...")
+        if 'make_interpreter' in globals() and os.path.exists(tpu_model_path):
+            try:
+                tpu_interpreter = make_interpreter(tpu_model_path)
+                tpu_interpreter.allocate_tensors()
+                print(f"Edge TPU model loaded successfully from {tpu_model_path}")
+            except Exception as e:
+                print(f"ERROR: Failed to initialize Edge TPU interpreter: {e}")
+                print("Face detection will fall back to CPU. This will be very slow.")
+                tpu_interpreter = None # Ensure it's None on failure
+        else:
+            print(f"WARNING: PyCoral not found or TPU model not found at '{tpu_model_path}'.")
+            print("Face detection will fall back to CPU. This will be very slow.")
+
 
         # --- Initialize the configured TTS engine ---
         tts_engine_choice = config_data.get("tts_engine", "pyttsx3")
@@ -407,10 +534,11 @@ def main():
         # rely on manual lens focus and the camera's default startup behavior.
         # We will leave the warm-up period, as that is still beneficial.
         print("Skipping software autofocus attempt to prevent driver errors. Please use the manual focus ring on the lens.")
-
+        
         # --- Camera warm-up period ---
+        camera_warmup_time = config_data.get("camera_warmup_time", 2.0)
         print("Letting camera warm up...")
-        time.sleep(2.0)  # Wait 2 seconds for auto-exposure and focus to settle
+        time.sleep(camera_warmup_time)  # Wait for auto-exposure and focus to settle
         # Read and discard a few frames to clear the camera's buffer
         for _ in range(5):
             video_capture.read()
@@ -430,7 +558,11 @@ def main():
         print(f"An error occurred during initialization: {e}")
         return
 
-    last_played_times = {}
+    # --- State management for match interval ---
+    recognition_state = 'SEARCHING'
+    cooldown_end_time = 0
+    match_interval = config_data.get("match_interval", 10) # Default to 10 seconds
+    interval_message = config_data.get("interval_message", "Looking for new faces.")
 
     # --- Main Loop ---
     while True:
@@ -439,13 +571,52 @@ def main():
         if not ret:
             print("Failed to grab frame. Exiting.")
             break
+        
+        # Default to showing the raw frame, which will be updated if processing occurs
+        processed_frame = frame
 
-        # Process the frame for faces
-        recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names)
+        if recognition_state == 'SEARCHING':
+            # Process the frame for faces using the appropriate method
+            if tpu_interpreter:
+                # Use the fast, TPU-accelerated pipeline
+                recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage)
+            else:
+                recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names)
 
-        # Trigger audio response for each recognized person
-        for name in recognized_names:
-            play_response(name, config_data, tts_client, last_played_times)
+            # If any face was detected (known or unknown)
+            if recognized_names:
+                # Announce the results of the match attempt to the console for clarity.
+                print(f"Match attempt complete. Results: {recognized_names}")
+
+                # Trigger audio response for each recognized person
+                for name in recognized_names:
+                    play_response(name, config_data, tts_client)
+                
+                # Start the cooldown period
+                print(f"Entering {match_interval}s cooldown.")
+                recognition_state = 'COOLDOWN'
+                cooldown_end_time = time.time() + match_interval
+
+        elif recognition_state == 'COOLDOWN':
+            # During cooldown, we don't process for faces. We just display the live feed.
+            # Display a waiting message on the frame.
+            cooldown_remaining = max(0, int(cooldown_end_time - time.time()))
+            text = f"Waiting... ({cooldown_remaining}s)"
+            font = cv2.FONT_HERSHEY_DUPLEX
+            cv2.putText(processed_frame, text, (10, 40), font, 1.0, (0, 255, 255), 2)
+
+            if time.time() >= cooldown_end_time:
+                print("Cooldown finished. Announcing and returning to search mode.")
+                # Announce that we are searching again
+                if interval_message and tts_client:
+                    announcement_thread = threading.Thread(
+                        target=_play_audio_threaded,
+                        args=(interval_message, config_data, tts_client)
+                    )
+                    announcement_thread.daemon = True
+                    announcement_thread.start()
+                
+                recognition_state = 'SEARCHING'
 
         # Display the resulting image
         cv2.imshow('Video', processed_frame)
