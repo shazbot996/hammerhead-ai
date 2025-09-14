@@ -179,7 +179,7 @@ def _play_audio_threaded(response_text, config_data, tts_client):
             except subprocess.CalledProcessError as e:
                 # This will catch errors if aplay returns a non-zero exit code
                 print(f"ERROR (Thread): aplay failed with exit code {e.returncode}.")
-                print(f"  mpg123 stderr: {e.stderr}")
+                print(f"  aplay stderr: {e.stderr}")
 
         elif tts_engine_choice == "pyttsx3" and tts_client:
             # --- pyttsx3 (local) Logic ---
@@ -219,7 +219,7 @@ def play_response(name, config_data, tts_client):
     audio_thread.daemon = True  # Allows main program to exit even if thread is running
     audio_thread.start()
 # --- 4. Process Frame ---
-def process_frame_cpu(frame, known_face_encodings, known_face_names):
+def process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance):
     """
     (CPU Fallback) Detects and recognizes faces using only the CPU.
     This is slow and should only be used if the Edge TPU fails.
@@ -238,15 +238,14 @@ def process_frame_cpu(frame, known_face_encodings, known_face_names):
 
     recognized_names = []
     for face_encoding in face_encodings:
-        # See if the face is a match for the known face(s)
-        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
         name = "unknown"
 
         # Use the known face with the smallest distance to the new face
         face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
         if len(face_distances) > 0:
             best_match_index = np.argmin(face_distances)
-            if matches[best_match_index]:
+            # Check if the best match is within the tolerance
+            if face_distances[best_match_index] <= recognition_tolerance:
                 name = known_face_names[best_match_index]
 
         recognized_names.append(name)
@@ -581,7 +580,7 @@ def main():
                 # Use the fast, TPU-accelerated pipeline
                 recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage)
             else:
-                recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names)
+                recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance)
 
             # If any face was detected (known or unknown)
             if recognized_names:
