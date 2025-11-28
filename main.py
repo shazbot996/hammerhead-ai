@@ -5,11 +5,12 @@ import re
 import cv2
 import argparse
 import random
+import hashlib
 import threading
 import pickle
 import face_recognition
 import numpy as np
-import pyttsx3
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import subprocess
 import netconfig
 try:
@@ -29,6 +30,7 @@ CONFIG_FILE_NAME = "config.json"
 LOCAL_CACHE_DIR = "local_data_cache"
 LOCAL_FACES_DIR = os.path.join(LOCAL_CACHE_DIR, "face-index")
 LOCAL_CONFIG_DIR = os.path.join(LOCAL_CACHE_DIR, "config")
+LOCAL_AUDIO_CACHE_DIR = os.path.join(LOCAL_CACHE_DIR, "audio_cache")
 
 TEMP_AUDIO_FILE_PREFIX = "temp_response" # Used for thread-safe filenames
 
@@ -43,6 +45,7 @@ def load_data():
     # Create local directories
     os.makedirs(LOCAL_FACES_DIR, exist_ok=True)
     os.makedirs(LOCAL_CONFIG_DIR, exist_ok=True)
+    os.makedirs(LOCAL_AUDIO_CACHE_DIR, exist_ok=True)
 
     config_data = {}
     local_config_path = os.path.join(LOCAL_CONFIG_DIR, CONFIG_FILE_NAME)
@@ -137,20 +140,23 @@ def index_faces():
 
     return known_face_encodings, known_face_names
 
-# --- 3. Play Response ---
-def _play_audio_threaded(response_text, config_data, tts_client):
+# --- 3. Audio Caching and Playback ---
+def _generate_and_cache_audio(text, config_data, tts_client):
     """
-    This function runs in a separate thread to play audio without blocking the main loop.
-    It contains the actual blocking TTS logic.
+    Generates a single audio file from text and saves it to the audio cache.
+    This is a blocking operation intended to be run at startup.
     """
     #print(f"DEBUG (Thread): Attempting to use '{config_data.get('tts_engine', 'pyttsx3')}' engine.")
-    tts_engine_choice = config_data.get("tts_engine", "pyttsx3")
-    temp_file = f"{TEMP_AUDIO_FILE_PREFIX}-{threading.get_ident()}.wav" # Use WAV format for better compatibility
+    tts_engine_choice = config_data.get("tts_engine")
+    # The final destination for the cached audio file.
+    filename = hashlib.md5(text.encode()).hexdigest() + ".wav"
+    cache_path = os.path.join(LOCAL_AUDIO_CACHE_DIR, filename)
+
     try:
         if tts_engine_choice == "google_cloud" and tts_client:
             # --- Google Cloud TTS Logic ---
             tts_config = config_data.get("tts_config", {}).get("google_cloud", {})
-            synthesis_input = texttospeech.SynthesisInput(text=response_text)
+            synthesis_input = texttospeech.SynthesisInput(text=text)
             voice = texttospeech.VoiceSelectionParams(
                 language_code=tts_config.get("language_code", "en-US"),
                 name=tts_config.get("voice_name", "en-US-Wavenet-D")
@@ -158,53 +164,93 @@ def _play_audio_threaded(response_text, config_data, tts_client):
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16, # Request WAV format
                 speaking_rate=tts_config.get("speaking_rate", 1.0),
-                sample_rate_hertz=tts_config.get("sample_rate_hertz", 22050), # Specify sample rate for WAV
+                sample_rate_hertz=tts_config.get("sample_rate_hertz", 24000), # Specify sample rate for WAV
                 pitch=tts_config.get("pitch", 0.0)
             )
             response = tts_client.synthesize_speech(
                 input=synthesis_input, voice=voice, audio_config=audio_config
             )
             
-            # 1. Write the entire audio content to a file. The 'with' statement ensures it's fully written and closed.
-            with open(temp_file, "wb") as out:
+            # Write the audio content directly to its final cache location.
+            with open(cache_path, "wb") as out:
                 out.write(response.audio_content)
-            
-            # --- Diagnostic Check: Ensure the audio file is not empty ---
-            if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
-                print("ERROR (Thread): Synthesized audio file is empty or was not created.")
-                return
 
-            # --- Play the WAV file using aplay, the standard Linux audio player ---
-            try:
-                #print(f"DEBUG (Thread): Playing {temp_file} with aplay...")
-                subprocess.run(
-                    ['aplay', '-q', temp_file], # The '-q' flag makes it quiet
-                    check=True,
-                    stderr=subprocess.PIPE # Capture errors if any
-                )
-            except FileNotFoundError:
-                print("\nERROR: 'aplay' command not found. This is highly unusual for a Linux system.\n")
-            except subprocess.CalledProcessError as e:
-                # This will catch errors if aplay returns a non-zero exit code
-                print(f"ERROR (Thread): aplay failed with exit code {e.returncode}.")
-                print(f"  aplay stderr: {e.stderr}")
-
-        elif tts_engine_choice == "pyttsx3" and tts_client:
-            # --- pyttsx3 (local) Logic ---
-            # NOTE: pyttsx3 is not strictly thread-safe. While this works in many
-            # cases, a more complex implementation might be needed if issues arise.
-            print("DEBUG (Thread): Synthesizing speech with pyttsx3.")
-            tts_client.say(response_text)
-            tts_client.runAndWait()
         else:
-            print(f"ERROR (Thread): TTS engine '{tts_engine_choice}' not supported or client not initialized.")
+            # This case is hit if the config specifies a different engine or if the Google client is None.
+            # We simply do not generate audio, which is the desired offline behavior.
+            pass
 
     except Exception as e:
-        print(f"ERROR (Thread): Failed to play TTS response: {e}")
-    finally:
-        # 3. Clean up the temp file after playback is guaranteed to be finished.
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+        print(f"ERROR: Failed to generate or save audio cache file for '{text[:30]}...': {e}")
+
+def pre_cache_audio(config_data, tts_client):
+    """
+    Checks all possible text responses from the config file and generates audio
+    for any that are not already cached.
+    """
+    if not tts_client:
+        print("WARNING: TTS client not initialized. Skipping audio pre-caching.")
+        return
+
+    print("\n--- Pre-caching Audio Responses ---")
+    all_phrases = set()
+
+    # 1. Gather all unique phrases from the config
+    # Startup greeting
+    startup = config_data.get("startup_greeting")
+    if isinstance(startup, str):
+        all_phrases.add(startup)
+    elif isinstance(startup, list):
+        all_phrases.update(startup)
+
+    # Interval messages
+    interval = config_data.get("interval_message")
+    if isinstance(interval, str):
+        all_phrases.add(interval)
+    elif isinstance(interval, list):
+        all_phrases.update(interval)
+
+    # Person-specific and unknown responses
+    responses = config_data.get("responses", {})
+    for response_value in responses.values():
+        if isinstance(response_value, str):
+            all_phrases.add(response_value)
+        elif isinstance(response_value, list):
+            all_phrases.update(response_value)
+
+    # 2. Check cache for each phrase and generate if missing
+    for phrase in all_phrases:
+        # Use a consistent, filesystem-safe filename
+        filename = hashlib.md5(phrase.encode()).hexdigest() + ".wav"
+        cache_path = os.path.join(LOCAL_AUDIO_CACHE_DIR, filename)
+
+        if not os.path.exists(cache_path):
+            print(f"  Cache miss for: '{phrase[:50]}...'")
+            print(f"  Generating audio and saving to {filename}...")
+            _generate_and_cache_audio(phrase, config_data, tts_client)
+        else:
+            # This can be commented out to reduce startup noise
+            print(f"  Cache hit for: '{phrase[:50]}...'")
+
+    print("--- Audio pre-caching complete. ---")
+
+def _play_audio_threaded(response_text, config_data, tts_client):
+    """
+    (NEW) This function runs in a separate thread to play a pre-cached audio file.
+    """
+    try:
+        filename = hashlib.md5(response_text.encode()).hexdigest() + ".wav"
+        cache_path = os.path.join(LOCAL_AUDIO_CACHE_DIR, filename)
+
+        if not os.path.exists(cache_path):
+            print(f"ERROR (Thread): Audio file not found in cache for '{response_text}'. Was it pre-cached?")
+            return
+
+        # Play the cached WAV file using aplay
+        subprocess.run(['aplay', '-q', cache_path], check=True, stderr=subprocess.PIPE)
+
+    except Exception as e:
+        print(f"ERROR (Thread): Failed to play cached audio: {e}")
 
 def start_audio_thread(name, config_data, tts_client):
     """
@@ -585,6 +631,9 @@ def main():
         if not config_data:
             return  # Exit if config loading failed
 
+        # --- Initialize TTS Engine (needed for pre-caching) ---
+        tts_engine_choice, tts_client = _initialize_tts(config_data)
+
         known_face_encodings, known_face_names = index_faces()
         if not known_face_encodings:
             print(f"No faces were indexed. Please check the '{LOCAL_FACES_DIR}' directory.")
@@ -611,51 +660,9 @@ def main():
             print(f"WARNING: PyCoral not found or TPU model not found at '{tpu_model_path}'.")
             print("Face detection will fall back to CPU. This will be very slow.")
 
-
-        # --- Initialize the configured TTS engine ---
-        tts_engine_choice = config_data.get("tts_engine", "pyttsx3")
-        tts_client = None
-
-        # If using Google Cloud, set the credentials environment variable
-        if tts_engine_choice == "google_cloud":
-            key_path = config_data.get("gcp_service_account_key_path")
-            print(f"  - Checking for GCP key at: {key_path}")
-            if key_path and os.path.exists(key_path):
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-                print("  - GCP service account credentials SET from config file.")
-            else:
-                print("  - WARNING: GCP service account key NOT FOUND at the specified path.")
-
-
-        if tts_engine_choice == "google_cloud":
-            print("Initializing Google Cloud Text-to-Speech client...")
-            try:
-                tts_client = texttospeech.TextToSpeechClient()
-                print("Google Cloud TTS client initialized successfully.")
-            except Exception as e:
-                print(f"ERROR: Failed to initialize Google Cloud TTS. Check credentials/internet. {e}")
-                print("Falling back to local pyttsx3 engine.")
-                tts_engine_choice = "pyttsx3"
-
-        if tts_engine_choice == "pyttsx3":
-            print("Initializing local pyttsx3 Text-to-Speech engine...")
-            tts_client = pyttsx3.init()
-            # Apply custom pyttsx3 configuration if it exists
-            pyttsx3_config = config_data.get("tts_config", {}).get("pyttsx3", {})
-            if pyttsx3_config:
-                print("Applying custom pyttsx3 configuration...")
-                rate = pyttsx3_config.get("rate")
-                if rate is not None:
-                    tts_client.setProperty('rate', int(rate))
-                volume = pyttsx3_config.get("volume")
-                if volume is not None:
-                    tts_client.setProperty('volume', float(volume))
-                voice_id = pyttsx3_config.get("voice_id")
-                if voice_id:
-                    tts_client.setProperty('voice', voice_id)
-
-        if tts_client is None:
-            print("ERROR: Could not initialize any TTS engine. Audio will be disabled.")
+        # --- Pre-cache all audio responses ---
+        # This will generate .wav files for any new/changed phrases in the config.
+        pre_cache_audio(config_data, tts_client)
 
         # --- Handle TTS Test Argument ---
         if args.test_tts:
@@ -663,7 +670,11 @@ def main():
             print(f"Input phrase: '{args.test_tts}'")
             if tts_client:
                 # We can call the threaded function directly for the test
-                _play_audio_threaded(args.test_tts, config_data, tts_client)
+                # First, ensure the audio is generated
+                print("Generating test audio...")
+                _generate_and_cache_audio(args.test_tts, config_data, tts_client)
+                print("Playing test audio...")
+                _play_audio_threaded(args.test_tts, config_data, tts_client) # This now plays the cached file
                 print("--- TTS Test Complete ---")
             else:
                 print("ERROR: Cannot run test, TTS client failed to initialize.")
@@ -671,18 +682,25 @@ def main():
 
         # --- Play Startup Greeting ---
         startup_greeting = config_data.get("startup_greeting")
-        if startup_greeting and tts_client:
-            print(f"\n--- Playing Startup Greeting ---")
-            print(f"Message: '{startup_greeting}'")
-            # We can use the same threaded player.
-            # We don't need to join this thread, as it can play in the background
-            # while the camera initializes.
-            startup_audio_thread = threading.Thread(
-                target=_play_audio_threaded,
-                args=(startup_greeting, config_data, tts_client)
-            )
-            startup_audio_thread.daemon = True
-            startup_audio_thread.start()
+        if startup_greeting:
+            message_to_say = ""
+            if isinstance(startup_greeting, list) and startup_greeting:
+                message_to_say = random.choice(startup_greeting)
+            elif isinstance(startup_greeting, str):
+                message_to_say = startup_greeting
+
+            if message_to_say and tts_client:
+                print(f"\n--- Playing Startup Greeting ---")
+                print(f"Message: '{message_to_say}'")
+                # We can use the same threaded player.
+                # We don't need to join this thread, as it can play in the background
+                # while the camera initializes.
+                startup_audio_thread = threading.Thread(
+                    target=_play_audio_threaded,
+                    args=(message_to_say, config_data, tts_client)
+                )
+                startup_audio_thread.daemon = True
+                startup_audio_thread.start()
 
         # --- Initialize video capture ---
         print("Initializing camera...")
@@ -826,6 +844,40 @@ def main():
     for item in os.listdir('.'):
         if item.startswith(TEMP_AUDIO_FILE_PREFIX) and item.endswith(".wav"):
             os.remove(os.path.join('.', item))
+
+def _initialize_tts(config_data):
+    """Helper function to set up the TTS client based on config."""
+    tts_engine_choice = config_data.get("tts_engine")
+    tts_client = None
+
+    # Only proceed if the configured engine is 'google_cloud' and the library was imported.
+    if tts_engine_choice != "google_cloud" or 'texttospeech' not in globals():
+        if tts_engine_choice: # Only print a warning if an engine was specified but is unsupported/unavailable
+             print(f"WARNING: TTS engine is set to '{tts_engine_choice}', but only 'google_cloud' is supported. Audio will be disabled.")
+        return None, None # Return None for both client and engine choice
+
+    # Set the credentials environment variable for Google Cloud
+    key_path = config_data.get("gcp_service_account_key_path")
+    print(f"  - Checking for GCP key at: {key_path}")
+    if key_path and os.path.exists(key_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+        print("  - GCP service account credentials SET from config file.")
+    else:
+        print("  - WARNING: GCP service account key NOT FOUND at the specified path. Google TTS will likely fail.")
+
+    print("Initializing Google Cloud Text-to-Speech client (max 5s timeout)...")
+    # Use a ThreadPoolExecutor to enforce a timeout on the client initialization.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(texttospeech.TextToSpeechClient)
+        try:
+            tts_client = future.result(timeout=5)
+            print("Google Cloud TTS client initialized successfully.")
+        except (TimeoutError, Exception) as e:
+            print(f"ERROR: Could not initialize Google Cloud TTS client (likely offline or config error): {e}")
+            print("Audio generation will be disabled for this session.")
+            tts_client = None # Ensure client is None on failure
+
+    return tts_engine_choice, tts_client
 
 if __name__ == "__main__":
     main()
