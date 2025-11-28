@@ -4,6 +4,7 @@ import time
 import re
 import cv2
 import argparse
+import random
 import threading
 import pickle
 import face_recognition
@@ -205,26 +206,35 @@ def _play_audio_threaded(response_text, config_data, tts_client):
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-def play_response(name, config_data, tts_client):
+def start_audio_thread(name, config_data, tts_client):
     """
     Looks up a response and starts a new thread to play it using text-to-speech.
     """
     # Look for responses within the 'responses' key of the config data
-    responses = config_data.get("responses", {})
-    response_text = responses.get(name, responses.get("unknown"))
+    all_responses = config_data.get("responses", {})
+    # Get the response for the specific name, or fall back to the "unknown" response.
+    response_value = all_responses.get(name, all_responses.get("unknown"))
 
-    if not response_text:
+    if not response_value:
         return
 
-    print(f"Recognized {name}. Playing response: '{response_text}'")
+    message_to_say = ""
+    # If the response is a list, pick a random one. If it's a string, use it directly.
+    if isinstance(response_value, list) and response_value:
+        message_to_say = random.choice(response_value)
+    elif isinstance(response_value, str):
+        message_to_say = response_value
+
+    print(f"Recognized {name}. Playing response: '{message_to_say}'")
 
     # Create and start a new thread for audio playback to avoid blocking the video loop
-    audio_thread = threading.Thread(
+    thread = threading.Thread(
         target=_play_audio_threaded,
-        args=(response_text, config_data, tts_client)
+        args=(message_to_say, config_data, tts_client)
     )
-    audio_thread.daemon = True  # Allows main program to exit even if thread is running
-    audio_thread.start()
+    thread.daemon = True  # Allows main program to exit even if thread is running
+    thread.start()
+    return thread # Return the thread so the main loop can monitor it
 # --- 4. Process Frame ---
 def process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance):
     """
@@ -310,6 +320,12 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         bottom = int(bbox.ymax * frame_height)
         right = int(bbox.xmax * frame_width)
 
+        # --- Add a sanity check for the bounding box dimensions ---
+        # Occasionally, the TPU can return a malformed box. If the box has no area,
+        # skip it to prevent errors during cropping.
+        if not (right > left and bottom > top):
+            continue # Skip this invalid detection
+
         # # --- Filter based on face size to reject detections that are too small or too large ---
         # bbox_height = bottom - top
         # height_percentage = bbox_height / frame_height
@@ -345,6 +361,12 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         crop_bottom = min(frame_height, bottom + y_buffer)
         crop_left = max(0, left - x_buffer)
         crop_right = min(frame_width, right + x_buffer)
+
+        # --- Add a second sanity check for the final crop dimensions ---
+        # After adding buffers, it's still possible for the crop area to be invalid
+        # (e.g., if the original bbox was right on the edge of the frame).
+        if not (crop_right > crop_left and crop_bottom > crop_top):
+            continue # Skip this invalid crop
 
         # Create the cropped image of the face
         # A copy is made to ensure the numpy array is C-contiguous in memory,
@@ -714,8 +736,9 @@ def main():
     # --- State management for match interval ---
     recognition_state = 'SEARCHING'
     cooldown_end_time = 0
+    active_audio_thread = None
     match_interval = config_data.get("match_interval", 10) # Default to 10 seconds
-    interval_message = config_data.get("interval_message", "Looking for new faces.")
+    interval_messages = config_data.get("interval_message", "Looking for new faces.")
 
     # --- Main Loop ---
     while True:
@@ -741,17 +764,26 @@ def main():
                 # Announce the results of the match attempt to the console for clarity.
                 print(f"Match attempt complete. Results: {recognized_names}")
 
-                # Trigger audio response for each recognized person, but NOT for "too_far"
-                for name in recognized_names:
-                    play_response(name, config_data, tts_client)
+                # We'll respond to the first recognized person in the list.
+                # This prevents multiple overlapping audio responses.
+                name_to_respond = recognized_names[0]
+                active_audio_thread = start_audio_thread(name_to_respond, config_data, tts_client)
                 
-                # Start the cooldown period
-                print(f"Entering {match_interval}s cooldown.")
+                # Transition to the SPEAKING state to wait for audio to finish.
+                recognition_state = 'SPEAKING'
+                print("Transitioning to SPEAKING state.")
+
+        elif recognition_state == 'SPEAKING':
+            # In this state, we just wait for the audio thread to finish.
+            cv2.putText(processed_frame, "Responding...", (10, 40), cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 255, 255), 2)
+            if active_audio_thread and not active_audio_thread.is_alive():
+                print("Audio finished. Transitioning to COOLDOWN state.")
                 recognition_state = 'COOLDOWN'
                 cooldown_end_time = time.time() + match_interval
+                active_audio_thread = None # Clear the completed thread
 
         elif recognition_state == 'COOLDOWN':
-            # During cooldown, we don't process for faces. We just display the live feed.
+            # This is now a pure "quiet time" after speaking.
             # Display a waiting message on the frame.
             cooldown_remaining = max(0, int(cooldown_end_time - time.time()))
             text = f"Waiting... ({cooldown_remaining}s)"
@@ -761,13 +793,21 @@ def main():
             if time.time() >= cooldown_end_time:
                 print("Cooldown finished. Announcing and returning to search mode.")
                 # Announce that we are searching again
-                if interval_message and tts_client:
-                    announcement_thread = threading.Thread(
-                        target=_play_audio_threaded,
-                        args=(interval_message, config_data, tts_client)
-                    )
-                    announcement_thread.daemon = True
-                    announcement_thread.start()
+                if interval_messages and tts_client:
+                    message_to_say = ""
+                    # If it's a list, pick a random one. If it's a string, use it directly.
+                    if isinstance(interval_messages, list) and interval_messages:
+                        message_to_say = random.choice(interval_messages)
+                    elif isinstance(interval_messages, str):
+                        message_to_say = interval_messages
+
+                    if message_to_say:
+                        announcement_thread = threading.Thread(
+                            target=_play_audio_threaded,
+                            args=(message_to_say, config_data, tts_client)
+                        )
+                        announcement_thread.daemon = True
+                        announcement_thread.start()
                 
                 recognition_state = 'SEARCHING'
 
