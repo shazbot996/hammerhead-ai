@@ -6,16 +6,15 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 # Change to the script's directory to ensure all relative paths in the Python script work correctly.
-cd "$SCRIPT_DIR"
+# cd "$SCRIPT_DIR" # Temporarily disabled for troubleshooting. We will call python with an absolute path.
 
 echo "Starting Hammerhead AI application..."
 
+# Set the pixel format for V4L2 to prevent OpenCV errors with certain cameras (e.g., MJPEG default).
+# 'YUYV' is a widely supported format that OpenCV can handle.
+export V4L2_PIXEL_FORMAT=YUYV
 
-# The line below is a WORKAROUND for a dependency conflict between older libraries
-# (like face_recognition or edgetpu) and newer Google Cloud libraries.
-# It forces protobuf to use a slower, pure-Python implementation that is more
-# compatible across different versions. This allows us to use a modern protobuf
-# version required by google-cloud-* packages while still running the older code.
-export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
- 
-DISPLAY=:0 python3 main.py
+# The `DISPLAY=:0` part tells the application to use the primary display connected to the board.
+# We now use an absolute path to the main script to avoid any issues related to the current working directory.
+# Explicitly calling 'python3' is more robust and avoids issues with file line-endings (CRLF vs LF).
+DISPLAY=:0 python3 "${SCRIPT_DIR}/main.py"

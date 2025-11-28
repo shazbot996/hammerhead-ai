@@ -276,14 +276,17 @@ def process_frame_cpu(frame, known_face_encodings, known_face_names, recognition
 
     return recognized_names, frame
 
-def process_frame(frame, known_face_encodings, known_face_names, interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage):
+def process_frame(frame, known_face_encodings, known_face_names, interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage, max_face_height_percentage):
     """
     Detects faces using the Edge TPU and recognizes them using the CPU.
     This is the primary, high-performance processing function.
     """
     # --- Stage 1: Face Detection on the Edge TPU ---
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame_height, frame_width, _ = frame.shape
+    # Create a copy to draw on, leaving the original frame untouched.
+    output_frame = frame.copy()
+
+    rgb_frame = cv2.cvtColor(output_frame, cv2.COLOR_BGR2RGB)
+    frame_height, frame_width, _ = output_frame.shape
     _, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
 
     # Resize image to the expected input shape of the TPU model
@@ -294,8 +297,8 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
     interpreter.invoke()
     detected_objects = detect.get_objects(interpreter, detection_threshold, (1.0, 1.0))
 
-    recognized_names = []     # Names of successfully recognized faces
-    successful_locations = [] # Bboxes for successful encodings
+    # This list will hold comprehensive results for each processed face.
+    recognition_results = []
     failed_locations = []     # Bboxes for failed encodings
 
     # --- Stage 2: Face Recognition on the CPU for each detected face ---
@@ -307,15 +310,30 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         bottom = int(bbox.ymax * frame_height)
         right = int(bbox.xmax * frame_width)
 
-        # --- Filter based on face size relative to frame height ---
-        # This is the primary filter to only process faces that are close to the camera.
-        bbox_height = bottom - top
-        height_percentage = bbox_height / frame_height
-        if height_percentage < min_face_height_percentage:
-            # This face is too far away, ignore it completely.
-            # print(f"DEBUG: Ignoring face, height {height_percentage:.2f} is less than threshold {min_face_height_percentage:.2f}")
-            continue
+        # # --- Filter based on face size to reject detections that are too small or too large ---
+        # bbox_height = bottom - top
+        # height_percentage = bbox_height / frame_height
 
+        # # Filter 1: Ignore faces that are too large (likely false positives covering the whole frame).
+        # if height_percentage > max_face_height_percentage:
+        #     # Add this failure to the list for visual debugging before skipping.
+        #     failed_locations.append({
+        #         'bbox': (top, right, bottom, left),
+        #         'reason': f'Too Large ({height_percentage:.2f})',
+        #         'score': obj.score
+        #     })
+        #     continue
+
+        # # Filter 2: Ignore faces that are too small (too far away to be reliably identified).
+        # if height_percentage < min_face_height_percentage:
+        #     # This face is too far away, ignore it completely.
+        #     # We'll treat this as a failed detection for visual feedback.
+        #     failed_locations.append({
+        #         'bbox': (top, right, bottom, left),
+        #         'reason': f'Too Small ({height_percentage:.2f})',
+        #         'score': obj.score
+        #     })
+        #     continue
         # --- OPTIMIZATION: Crop the face before recognition ---
         # This is the key to performance. We pass a small, cropped image to the
         # face_recognition library instead of the entire frame.
@@ -333,14 +351,19 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         # which is required by the underlying dlib library.
         face_image = rgb_frame[crop_top:crop_bottom, crop_left:crop_right].copy()
 
-        # --- Add a size filter to reject tiny detections ---
-        crop_height, crop_width, _ = face_image.shape
-        MIN_CROP_SIZE = 40 # Minimum pixel dimension for a crop to be considered
-        if crop_width < MIN_CROP_SIZE or crop_height < MIN_CROP_SIZE:
-            # This crop is too small to be reliably identified. Skip it.
-            # The yellow box drawn later will indicate this was a failed detection.
-            failed_locations.append((top, right, bottom, left))
-            continue
+        # Get the dimensions of the crop for logging purposes.
+        crop_height, crop_width, _ = face_image.shape if face_image.size > 0 else (0, 0, 0)
+        # # --- Add a size filter to reject tiny detections ---
+        # MIN_CROP_SIZE = 40 # Minimum pixel dimension for a crop to be considered
+        # if crop_width < MIN_CROP_SIZE or crop_height < MIN_CROP_SIZE:
+        #     # This crop is too small to be reliably identified. Skip it.
+        #     # The yellow box drawn later will indicate this was a failed detection.
+        #     failed_locations.append({
+        #         'bbox': (top, right, bottom, left),
+        #         'reason': 'Crop Too Small',
+        #         'score': obj.score
+        #     })
+        #     continue
 
         # Now, run recognition on the SMALL, CROPPED face image. This is much faster.
         # We pass `None` for locations because the library will find the single face in our crop.
@@ -348,6 +371,8 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
 
         if face_encodings:
             name = "unknown"
+            distance = -1.0 # Default distance for unknown faces
+
             # We have an encoding, now compare it to our known faces
             face_encoding = face_encodings[0]
 
@@ -357,6 +382,7 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
             if len(face_distances) > 0:
                 best_match_index = np.argmin(face_distances)
                 best_match_distance = face_distances[best_match_index]
+                distance = best_match_distance # Store the distance for display
 
                 # Print the distance for debugging. This is very helpful for tuning!
                 print(f"DEBUG: Closest match distance: {best_match_distance:.4f} (Threshold: {recognition_tolerance})")
@@ -365,32 +391,60 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
                 if best_match_distance <= recognition_tolerance:
                     name = known_face_names[best_match_index]
             
-            recognized_names.append(name)
-            successful_locations.append((top, right, bottom, left))
+            recognition_results.append({
+                'bbox': (top, right, bottom, left),
+                'name': name,
+                'distance': distance,
+                'score': obj.score
+            })
         else:
             # This is useful for debugging false positives from the TPU detector.
             print(f"DEBUG: TPU detected an object, but face_recognition could not generate an encoding from it. Crop size: {crop_width}x{crop_height}")
-            failed_locations.append((top, right, bottom, left))
+            failed_locations.append({
+                'bbox': (top, right, bottom, left),
+                'reason': 'No Encoding',
+                'score': obj.score
+            })
 
     # --- For visualization ---
     # Draw YELLOW boxes for detections that failed the encoding/size check
-    for (top, right, bottom, left) in failed_locations:
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 255), 2) # Yellow
+    for failure in failed_locations:
+        top, right, bottom, left = failure['bbox']
+        reason = failure['reason']
+        score = failure['score']
+        cv2.rectangle(output_frame, (left, top), (right, bottom), (0, 255, 255), 2) # Yellow
+        # Display the reason for failure and the TPU score
+        cv2.putText(output_frame, f"{reason} (S:{score:.2f})", (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    # Draw color-coded boxes for successful recognitions
+    for result in recognition_results:
+        top, right, bottom, left = result['bbox']
+        name = result['name']
+        # Use .get() to safely access keys that may not exist for filtered results.
+        distance = result.get('distance', -1.0)
+        score = result.get('score', 0.0)
+
+        # --- Determine box color based on result ---
+        if name == "unknown":
+            box_color = (255, 0, 0) # Blue for unknown
+        else:
+            box_color = (0, 255, 0) # Green for a known match
+
+        # Draw the bounding box
+        cv2.rectangle(output_frame, (left, top), (right, bottom), box_color, 2)
+
+        # Only draw the name label for actual recognition results
+        cv2.rectangle(output_frame, (left, bottom - 35), (right, bottom), box_color, cv2.FILLED)
         font = cv2.FONT_HERSHEY_DUPLEX
-        # Optionally, add text to the failed boxes
-        # cv2.putText(frame, 'detect_fail', (left + 6, bottom - 6), font, 0.5, (0, 0, 0), 1)
+        cv2.putText(output_frame, name, (left + 6, bottom - 6), font, 1.0, (0, 0, 0), 1)
 
-    # Draw GREEN boxes for successful recognitions (known or unknown)
-    for (top, right, bottom, left), name in zip(successful_locations, recognized_names):
-        # Draw a box around the face
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+        # Display the TPU score and recognition distance above the box
+        distance_text = f"D:{distance:.2f}" if distance != -1.0 else ""
+        cv2.putText(output_frame, f"S:{score:.2f} {distance_text}", (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
-        # Draw a label with a name below the face
-        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
-        font = cv2.FONT_HERSHEY_DUPLEX
-        cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
-
-    return recognized_names, frame
+    # Extract just the names for the main loop's logic
+    recognized_names = [res['name'] for res in recognition_results if res.get('name')]
+    return recognized_names, output_frame
 
 
 # --- 5. Helper Functions ---
@@ -437,7 +491,7 @@ def sync_data_from_removable_media(local_cache_path):
         # The mount command is kept simple to support various filesystems (e.g., ext4).
         # We will handle permissions during the copy stage.
         subprocess.run(
-            ['sudo', 'mount', SD_CARD_DEVICE, MOUNT_POINT],
+            ['sudo', '-E', 'mount', SD_CARD_DEVICE, MOUNT_POINT],
             check=True, stderr=subprocess.PIPE
         )
         is_mounted = True
@@ -456,7 +510,7 @@ def sync_data_from_removable_media(local_cache_path):
             # We use 'sudo cp' because the mounted files will likely be owned by root.
             # This requires passwordless sudo for the 'cp' command.
             subprocess.run(
-                ['sudo', 'cp', '-arT', sd_source_path, local_cache_path],
+                ['sudo', '-E', 'cp', '-arT', sd_source_path, local_cache_path],
                 check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
             )
 
@@ -467,7 +521,7 @@ def sync_data_from_removable_media(local_cache_path):
             uid, gid = os.getuid(), os.getgid()
             print(f"Resetting ownership of '{local_cache_path}' to user {uid}...")
             subprocess.run(
-                ['sudo', 'chown', '-R', f'{uid}:{gid}', local_cache_path],
+                ['sudo', '-E', 'chown', '-R', f'{uid}:{gid}', local_cache_path],
                 check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
             )
 
@@ -485,7 +539,7 @@ def sync_data_from_removable_media(local_cache_path):
         # 5. Unmount the device, but only if we successfully mounted it.
         if is_mounted:
             print(f"Unmounting {MOUNT_POINT}...")
-            subprocess.run(['sudo', 'umount', MOUNT_POINT], check=False) # Use check=False to avoid crashing on unmount error
+            subprocess.run(['sudo', '-E', 'umount', MOUNT_POINT], check=False) # Use check=False to avoid crashing on unmount error
         print("--- Finished SD card sync process. ---")
 
 # --- 6. Main Orchestrator ---
@@ -519,6 +573,7 @@ def main():
         detection_threshold = config_data.get("tpu_detection_threshold", 0.6)
         recognition_tolerance = config_data.get("recognition_tolerance", 0.6)
         min_face_height_percentage = config_data.get("min_face_height_percentage", 0.25) # e.g., 0.25 means face must be 25% of frame height
+        max_face_height_percentage = config_data.get("max_face_height_percentage", 0.95) # e.g., 0.95 means face must be less than 95% of frame height
         tpu_interpreter = None
         print("Initializing Edge TPU for face detection...")
         if 'make_interpreter' in globals() and os.path.exists(tpu_model_path):
@@ -607,16 +662,24 @@ def main():
             startup_audio_thread.daemon = True
             startup_audio_thread.start()
 
-        # Initialize video capture
+        # --- Initialize video capture ---
         print("Initializing camera...")
-        camera_index = find_camera_index()
-        if camera_index == -1:
-            print("ERROR: No camera found. Please check hardware connection.")
-            return
+        # Get camera index from config, with a fallback to auto-detection.
+        camera_index = config_data.get("camera_index") # Returns None if not found
+
+        if camera_index is not None:
+            print(f"Using camera index {camera_index} from configuration file.")
+        else:
+            print("Camera index not specified in config. Searching for available camera...")
+            camera_index = find_camera_index()
+            if camera_index == -1:
+                print("ERROR: No camera found. Please check hardware connection.")
+                return
 
         video_capture = cv2.VideoCapture(camera_index)
         if not video_capture.isOpened():
-            print("Error: Could not open video stream.")
+            # The error message now includes the index that failed.
+            print(f"Error: Could not open video stream at index {camera_index}.")
             return
 
         # The software autofocus attempt below can cause an infinite loop of 'VIDIOC_QUERYCTRL'
@@ -663,13 +726,13 @@ def main():
             break
         
         # Default to showing the raw frame, which will be updated if processing occurs
-        processed_frame = frame
+        processed_frame = frame.copy() # Use a copy to avoid modifying the original frame
 
         if recognition_state == 'SEARCHING':
             # Process the frame for faces using the appropriate method
             if tpu_interpreter:
                 # Use the fast, TPU-accelerated pipeline
-                recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage)
+                recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage, max_face_height_percentage)
             else:
                 recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance)
 
@@ -678,7 +741,7 @@ def main():
                 # Announce the results of the match attempt to the console for clarity.
                 print(f"Match attempt complete. Results: {recognized_names}")
 
-                # Trigger audio response for each recognized person
+                # Trigger audio response for each recognized person, but NOT for "too_far"
                 for name in recognized_names:
                     play_response(name, config_data, tts_client)
                 

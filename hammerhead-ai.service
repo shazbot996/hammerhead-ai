@@ -1,0 +1,33 @@
+[Unit]
+Description=Hammerhead AI Facial Recognition Application
+After=network-online.target graphical.target pulseaudio.service
+Wants=network-online.target pulseaudio.service
+
+[Service]
+# Replace 'mendel' with the actual username that owns the project files
+User=mendel
+Group=mendel
+
+# Set the working directory to your project's root
+WorkingDirectory=/home/mendel/hammerhead-ai
+
+# Environment variables needed by the script
+Environment="DISPLAY=:0"
+Environment="PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"
+# This variable is needed to force the camera driver to use a pixel format
+# that OpenCV can understand, preventing V4L2 errors on startup.
+Environment="V4L2_PIXEL_FORMAT=YUYV"
+# This is the crucial variable that allows the service to find the user's
+# PulseAudio server for sound playback. 1000 is the default UID for the 'mendel' user.
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+
+# --- Redirect output to the main console (tty1) for live debugging ---
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+
+ExecStart=/bin/bash /home/mendel/hammerhead-ai/start.sh
+Restart=on-failure
+
+[Install]
+WantedBy=graphical.target
