@@ -13,6 +13,10 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import subprocess
 import netconfig
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from io import BytesIO
+
 try:
     from pycoral.adapters import common
     from pycoral.adapters import detect
@@ -34,6 +38,14 @@ LOCAL_AUDIO_CACHE_DIR = os.path.join(LOCAL_CACHE_DIR, "audio_cache")
 
 TEMP_AUDIO_FILE_PREFIX = "temp_response" # Used for thread-safe filenames
 
+# --- Streaming Server Globals ---
+output_frame_for_stream = None
+stream_lock = threading.Lock()
+shutdown_event = threading.Event() # Global event for coordinating shutdown
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+    pass
 # --- 1. Load Local Data ---
 def load_data():
     """
@@ -61,15 +73,18 @@ def load_data():
     return config_data
 
 # --- 2. Index Faces ---
-def index_faces():
+def index_faces(force_reindex=False):
     """
     Loads face encodings from a cache file if it's valid, otherwise creates
     them from images and saves them to the cache. The cache is considered invalid
-    if the list of image filenames has changed.
+    if the list of image filenames on disk has changed.
+    (REFACTORED for simplicity and reliability)
+    (REFACTORED to use numpy/json instead of pickle)
     """
-    cache_path = os.path.join(LOCAL_CACHE_DIR, "face_encodings.pkl")
+    encodings_cache_path = os.path.join(LOCAL_CACHE_DIR, "face_encodings.npy")
+    names_cache_path = os.path.join(LOCAL_CACHE_DIR, "face_names.json")
 
-    # --- 1. Get the current list of image files to validate the cache ---
+    # --- 1. Get the current list of image files ---
     try:
         current_image_files = sorted([
             f for f in os.listdir(LOCAL_FACES_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -78,67 +93,80 @@ def index_faces():
         print(f"ERROR: Local faces directory not found: {LOCAL_FACES_DIR}")
         return [], []
 
-    # --- 2. Try to load from cache and validate it ---
-    if os.path.exists(cache_path):
-        print("Validating face-index cache by checking filenames...")
+    # --- 2. Try to load from cache ---
+    if not force_reindex and os.path.exists(encodings_cache_path) and os.path.exists(names_cache_path):
+        print("Attempting to load face-index from cache...")
         try:
-            with open(cache_path, 'rb') as f:
-                cached_data = pickle.load(f)
-            # Validate cache by comparing file lists. Using sets is a robust way to compare.
-            if set(cached_data.get('filenames', [])) == set(current_image_files):
-                print("Cache is valid. Loading encodings from cache.")
-                known_face_encodings = cached_data['encodings']
-                known_face_names = cached_data['names']
-                print(f"Cache loaded. Found {len(known_face_encodings)} indexed faces.")
-                return known_face_encodings, known_face_names
-            else:
-                print("Cache is stale (image file list has changed). Re-indexing...")
+            known_face_encodings = np.load(encodings_cache_path)
+            with open(names_cache_path, 'r') as f:
+                known_face_names = json.load(f)
+            
+            # Basic sanity check
+            if len(known_face_encodings) == len(known_face_names):
+                print("Cache loaded successfully.")
+                return list(known_face_encodings), known_face_names
+            print("Warning: Cache data is inconsistent (counts mismatch). Re-indexing.")
         except Exception as e:
-            print(f"Warning: Could not load or validate cache file ({e}). Re-indexing from images.")
+            print(f"Warning: Could not load cache files ({e}). Re-indexing from images.")
+    elif force_reindex:
+        print("--- Force-reindex flag detected. Re-indexing all faces. ---")
 
     # --- 3. If cache is invalid or doesn't exist, index from images ---
     print("Indexing faces from image files...")
-    if not current_image_files:
+    if not current_image_files: # If no image files are found, there's nothing to index.
         print("No image files found in face-index directory.")
-        if os.path.exists(cache_path):
-            os.remove(cache_path)
-            print("Removed old cache file.")
+        if os.path.exists(encodings_cache_path): os.remove(encodings_cache_path)
+        if os.path.exists(names_cache_path): os.remove(names_cache_path)
+        print("Removed old cache files.")
         return [], []
 
     known_face_encodings = []
     known_face_names = []
     for filename in current_image_files:
-        path = os.path.join(LOCAL_FACES_DIR, filename)
-        name = re.split(r'[-\d._]', os.path.splitext(filename)[0])[0]
-        if not name:
-            print(f"Could not parse name from filename: {filename}. Skipping.")
-            continue
-
-        print(f"Processing {filename} for person: {name}")
-        image = face_recognition.load_image_file(path)
-        encodings = face_recognition.face_encodings(image)
-
-        if encodings:
-            known_face_encodings.append(encodings[0])
-            known_face_names.append(name)
-        else:
-            print(f"Warning: No face found in {filename}. Skipping.")
+        result = _process_single_face_image(filename)
+        if result:
+            known_face_encodings.append(result['encoding'])
+            known_face_names.append(result['name'])
 
     # --- 4. Save the newly generated encodings and file list to the cache ---
     if known_face_encodings:
         print(f"Face indexing complete. Found {len(known_face_encodings)} face(s).")
-        print(f"Saving new encodings to cache file: {cache_path}")
-        cache_data = {
-            'filenames': current_image_files,
-            'encodings': known_face_encodings,
-            'names': known_face_names
-        }
-        with open(cache_path, 'wb') as f:
-            pickle.dump(cache_data, f)
+        print(f"Saving new index to cache files...")
+        try:
+            # Save the numpy arrays to a .npy file
+            np.save(encodings_cache_path, np.array(known_face_encodings))
+            # Save the list of names to a .json file
+            with open(names_cache_path, 'w') as f:
+                json.dump(known_face_names, f)
+            print("Cache saved successfully.")
+        except Exception as e:
+            print(f"ERROR: Failed to write cache file: {e}")
     else:
         print("Face indexing complete. No faces were found to cache.")
+        if os.path.exists(encodings_cache_path): os.remove(encodings_cache_path)
+        if os.path.exists(names_cache_path): os.remove(names_cache_path)
 
     return known_face_encodings, known_face_names
+
+def _process_single_face_image(filename):
+    """Helper function to process one image file for face encoding."""
+    path = os.path.join(LOCAL_FACES_DIR, filename)
+    name = re.split(r'[-\d._]', os.path.splitext(filename)[0])[0]
+    if not name:
+        print(f"Could not parse name from filename: {filename}. Skipping.")
+        return None
+    
+    print(f"  - Processing {filename} for person: {name}")
+    image = face_recognition.load_image_file(path)
+    encodings = face_recognition.face_encodings(image)
+
+    if encodings:
+        if len(encodings) > 1:
+            print(f"Warning: Multiple faces found in {filename}. Using the first one found. To ensure accuracy, consider editing the image to show only one face.")
+        return {'name': name, 'encoding': encodings[0]}
+    else:
+        print(f"Warning: No face found in {filename}. Skipping.")
+        return None
 
 # --- 3. Audio Caching and Playback ---
 def _generate_and_cache_audio(text, config_data, tts_client):
@@ -218,6 +246,13 @@ def pre_cache_audio(config_data, tts_client):
         elif isinstance(response_value, list):
             all_phrases.update(response_value)
 
+    # Wait jokes
+    wait_jokes = config_data.get("responses", {}).get("wait_jokes")
+    if isinstance(wait_jokes, str):
+        all_phrases.add(wait_jokes)
+    elif isinstance(wait_jokes, list):
+        all_phrases.update(wait_jokes)
+
     # 2. Check cache for each phrase and generate if missing
     for phrase in all_phrases:
         # Use a consistent, filesystem-safe filename
@@ -281,6 +316,31 @@ def start_audio_thread(name, config_data, tts_client):
     thread.daemon = True  # Allows main program to exit even if thread is running
     thread.start()
     return thread # Return the thread so the main loop can monitor it
+
+def start_joke_thread(config_data, tts_client):
+    """
+    Selects a random joke from the 'wait_jokes' list and starts a thread to play it.
+    """
+    all_responses = config_data.get("responses", {})
+    joke_list = all_responses.get("wait_jokes")
+
+    if not joke_list:
+        print("WARNING: 'wait_jokes' list not found in config. No joke will be played.")
+        return None
+
+    message_to_say = ""
+    if isinstance(joke_list, list) and joke_list:
+        message_to_say = random.choice(joke_list)
+    elif isinstance(joke_list, str): # Support a single string as well
+        message_to_say = joke_list
+
+    print(f"Playing a wait joke: '{message_to_say}'")
+
+    thread = threading.Thread(target=_play_audio_threaded, args=(message_to_say, config_data, tts_client))
+    thread.daemon = True
+    thread.start()
+    return thread
+
 # --- 4. Process Frame ---
 def process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance):
     """
@@ -372,30 +432,6 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
         if not (right > left and bottom > top):
             continue # Skip this invalid detection
 
-        # # --- Filter based on face size to reject detections that are too small or too large ---
-        # bbox_height = bottom - top
-        # height_percentage = bbox_height / frame_height
-
-        # # Filter 1: Ignore faces that are too large (likely false positives covering the whole frame).
-        # if height_percentage > max_face_height_percentage:
-        #     # Add this failure to the list for visual debugging before skipping.
-        #     failed_locations.append({
-        #         'bbox': (top, right, bottom, left),
-        #         'reason': f'Too Large ({height_percentage:.2f})',
-        #         'score': obj.score
-        #     })
-        #     continue
-
-        # # Filter 2: Ignore faces that are too small (too far away to be reliably identified).
-        # if height_percentage < min_face_height_percentage:
-        #     # This face is too far away, ignore it completely.
-        #     # We'll treat this as a failed detection for visual feedback.
-        #     failed_locations.append({
-        #         'bbox': (top, right, bottom, left),
-        #         'reason': f'Too Small ({height_percentage:.2f})',
-        #         'score': obj.score
-        #     })
-        #     continue
         # --- OPTIMIZATION: Crop the face before recognition ---
         # This is the key to performance. We pass a small, cropped image to the
         # face_recognition library instead of the entire frame.
@@ -421,17 +457,6 @@ def process_frame(frame, known_face_encodings, known_face_names, interpreter, de
 
         # Get the dimensions of the crop for logging purposes.
         crop_height, crop_width, _ = face_image.shape if face_image.size > 0 else (0, 0, 0)
-        # # --- Add a size filter to reject tiny detections ---
-        # MIN_CROP_SIZE = 40 # Minimum pixel dimension for a crop to be considered
-        # if crop_width < MIN_CROP_SIZE or crop_height < MIN_CROP_SIZE:
-        #     # This crop is too small to be reliably identified. Skip it.
-        #     # The yellow box drawn later will indicate this was a failed detection.
-        #     failed_locations.append({
-        #         'bbox': (top, right, bottom, left),
-        #         'reason': 'Crop Too Small',
-        #         'score': obj.score
-        #     })
-        #     continue
 
         # Now, run recognition on the SMALL, CROPPED face image. This is much faster.
         # We pass `None` for locations because the library will find the single face in our crop.
@@ -618,9 +643,13 @@ def main():
     # --- Argument Parsing for Test Mode ---
     parser = argparse.ArgumentParser(description="Facial Recognition with TTS response.")
     parser.add_argument('--test_tts', type=str, help="Run a TTS test with the given phrase and exit.")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument('--headless', action='store_true', help="Run in headless mode (no GUI, no stream).")
+    output_group.add_argument('--stream', action='store_true', help="Run in headless mode and stream video to http://<ip>:4664.")
+    parser.add_argument('--force-index', action='store_true', help="Force a full re-indexing of all face images.")
     args = parser.parse_args()
 
-    # --- Initialization ---
+    # --- Initialization ---    
     try:
         # First, attempt to sync data from an SD card BEFORE loading anything.
         # This allows the SD card to provide the initial config.json if needed.
@@ -632,12 +661,18 @@ def main():
             return  # Exit if config loading failed
 
         # --- Initialize TTS Engine (needed for pre-caching) ---
-        tts_engine_choice, tts_client = _initialize_tts(config_data)
+        tts_engine_choice, tts_client = _initialize_tts(config_data, args)
 
-        known_face_encodings, known_face_names = index_faces()
+        known_face_encodings, known_face_names = index_faces(args.force_index)
         if not known_face_encodings:
             print(f"No faces were indexed. Please check the '{LOCAL_FACES_DIR}' directory.")
             return
+        else:
+            # Add a clear, final summary of the loaded face index.
+            num_faces = len(known_face_encodings)
+            num_people = len(set(known_face_names))
+            print("\n--- Face Index Ready ---")
+            print(f"--- Loaded {num_faces} faces for {num_people} unique people. ---\n")
 
         # --- Initialize Edge TPU Face Detector ---
         tpu_model_path = config_data.get("tpu_model_path", "models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite")
@@ -689,19 +724,23 @@ def main():
             elif isinstance(startup_greeting, str):
                 message_to_say = startup_greeting
 
-            if message_to_say and tts_client:
+            # Play audio if we have a message AND (we are online OR we are in headless mode, which uses cache)
+            audio_is_possible = tts_client or args.headless
+            if message_to_say and audio_is_possible:
                 print(f"\n--- Playing Startup Greeting ---")
                 print(f"Message: '{message_to_say}'")
                 # We can use the same threaded player.
                 # We don't need to join this thread, as it can play in the background
                 # while the camera initializes.
                 startup_audio_thread = threading.Thread(
-                    target=_play_audio_threaded,
-                    args=(message_to_say, config_data, tts_client)
+                    target=_play_audio_threaded, args=(message_to_say, config_data, tts_client)
                 )
                 startup_audio_thread.daemon = True
                 startup_audio_thread.start()
-
+            else:
+                # If there's no greeting, we can start searching immediately.
+                startup_audio_thread = None
+        
         # --- Initialize video capture ---
         print("Initializing camera...")
         # Get camera index from config, with a fallback to auto-detection.
@@ -739,116 +778,229 @@ def main():
         print("\n--- Application starting ---")
         print("Press 'q' in the video window to quit.")
 
-        # --- Set up the display window ---
-        # For now, let's use a simple window to rule out any issues with fullscreen properties.
-        cv2.namedWindow('Video')
-        # Create a window that can be made full-screen
-        # cv2.namedWindow('Video', cv2.WND_PROP_FULLSCREEN)
-        # For a kiosk-like experience on the dev board, set it to full-screen
-        # cv2.setWindowProperty('Video', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        # --- Display Window Setup ---
+        # We will let cv2.imshow() create the window on its first call.
+        # Explicitly calling cv2.namedWindow() can sometimes cause GTK/GDK warnings,
+        # especially with fullscreen properties, so we will avoid it.
+        
+        # --- Start Streaming Server if requested ---
+        if args.stream:
+            try:
+                stream_port = 4664
+                server = ThreadingHTTPServer(('', stream_port), StreamingHandler)
+                server_thread = threading.Thread(target=server.serve_forever)
+                server_thread.daemon = True
+                server_thread.start()
+                print(f"--- Streaming server started on port {stream_port}. Access at http://<device_ip>:{stream_port} ---")
+            except Exception as e:
+                print(f"ERROR: Could not start streaming server: {e}")
 
     except Exception as e:
         print(f"An error occurred during initialization: {e}")
         return
 
-    # --- State management for match interval ---
-    recognition_state = 'SEARCHING'
+    # --- State Management ---
+    # Start in a pre-search state to allow the startup greeting to finish.
+    recognition_state = 'STARTING'
     cooldown_end_time = 0
-    active_audio_thread = None
+    active_audio_thread = startup_audio_thread # Monitor the startup greeting thread
     match_interval = config_data.get("match_interval", 10) # Default to 10 seconds
+
+    # New "wait joke" feature state
+    wait_joke_interval = config_data.get("wait_joke_interval", 120) # Default to 120 seconds (2 minutes)
+    last_activity_time = time.time()
+
     interval_messages = config_data.get("interval_message", "Looking for new faces.")
 
+    global output_frame_for_stream
+
     # --- Main Loop ---
-    while True:
-        # Grab a single frame of video
-        ret, frame = video_capture.read()
-        if not ret:
-            print("Failed to grab frame. Exiting.")
-            break
-        
-        # Default to showing the raw frame, which will be updated if processing occurs
-        processed_frame = frame.copy() # Use a copy to avoid modifying the original frame
+    try:
+        while True:
+            # Grab a single frame of video
+            ret, frame = video_capture.read()
+            if not ret:
+                print("Failed to grab frame. Exiting.")
+                break
+            
+            # Default to showing the raw frame, which will be updated if processing occurs
+            processed_frame = frame.copy() # Use a copy to avoid modifying the original frame
+            current_state_for_display = ""
 
-        if recognition_state == 'SEARCHING':
-            # Process the frame for faces using the appropriate method
-            if tpu_interpreter:
-                # Use the fast, TPU-accelerated pipeline
-                recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage, max_face_height_percentage)
-            else:
-                recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance)
+            if recognition_state == 'STARTING':
+                current_state_for_display = "Initializing..."
+                # Wait for the startup greeting to finish before we start searching.
+                if not active_audio_thread or not active_audio_thread.is_alive():
+                    print("Startup complete. Transitioning to SEARCHING state.")
+                    recognition_state = 'SEARCHING'
+                    last_activity_time = time.time() # Start the joke timer now
+                    active_audio_thread = None
 
-            # If any face was detected (known or unknown)
-            if recognized_names:
-                # Announce the results of the match attempt to the console for clarity.
-                print(f"Match attempt complete. Results: {recognized_names}")
-
-                # We'll respond to the first recognized person in the list.
-                # This prevents multiple overlapping audio responses.
-                name_to_respond = recognized_names[0]
-                active_audio_thread = start_audio_thread(name_to_respond, config_data, tts_client)
+            elif recognition_state == 'SEARCHING':
+                # Always process the frame in the SEARCHING state.
+                # Process the frame for faces using the appropriate method
+                if tpu_interpreter:
+                    # Use the fast, TPU-accelerated pipeline
+                    recognized_names, processed_frame = process_frame(frame, known_face_encodings, known_face_names, tpu_interpreter, detection_threshold, recognition_tolerance, min_face_height_percentage, max_face_height_percentage)
+                else:
+                    recognized_names, processed_frame = process_frame_cpu(frame, known_face_encodings, known_face_names, recognition_tolerance)
                 
-                # Transition to the SPEAKING state to wait for audio to finish.
-                recognition_state = 'SPEAKING'
-                print("Transitioning to SPEAKING state.")
+                # If any face was detected (known or unknown)
+                if recognized_names:
+                    # Activity detected: reset the joke timer.
+                    last_activity_time = time.time()
+                    
+                    # Announce the results of the match attempt to the console for clarity.
+                    print(f"Match attempt complete. Results: {recognized_names}")
+                    
+                    # We'll respond to the first recognized person in the list.
+                    # This prevents multiple overlapping audio responses.
+                    name_to_respond = recognized_names[0]
+                    active_audio_thread = start_audio_thread(name_to_respond, config_data, tts_client)
 
-        elif recognition_state == 'SPEAKING':
-            # In this state, we just wait for the audio thread to finish.
-            cv2.putText(processed_frame, "Responding...", (10, 40), cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 255, 255), 2)
-            if active_audio_thread and not active_audio_thread.is_alive():
-                print("Audio finished. Transitioning to COOLDOWN state.")
-                recognition_state = 'COOLDOWN'
-                cooldown_end_time = time.time() + match_interval
-                active_audio_thread = None # Clear the completed thread
+                    # Transition to the SPEAKING state to wait for audio to finish.
+                    recognition_state = 'SPEAKING'
+                    print("Transitioning to SPEAKING state.")
+                # If NO face was detected, check if the idle timer has expired.
+                elif (time.time() - last_activity_time) > wait_joke_interval:
+                    print("Wait joke timer expired. Transitioning to JOKING state.")
+                    active_audio_thread = start_joke_thread(config_data, tts_client)
+                    recognition_state = 'JOKING'
 
-        elif recognition_state == 'COOLDOWN':
-            # This is now a pure "quiet time" after speaking.
-            # Display a waiting message on the frame.
-            cooldown_remaining = max(0, int(cooldown_end_time - time.time()))
-            text = f"Waiting... ({cooldown_remaining}s)"
-            font = cv2.FONT_HERSHEY_DUPLEX
-            cv2.putText(processed_frame, text, (10, 40), font, 1.0, (0, 255, 255), 2)
+            elif recognition_state == 'SPEAKING':
+                # In this state, we just wait for the audio thread to finish.
+                current_state_for_display = "Responding..."
 
-            if time.time() >= cooldown_end_time:
-                print("Cooldown finished. Announcing and returning to search mode.")
-                # Announce that we are searching again
-                if interval_messages and tts_client:
-                    message_to_say = ""
-                    # If it's a list, pick a random one. If it's a string, use it directly.
-                    if isinstance(interval_messages, list) and interval_messages:
-                        message_to_say = random.choice(interval_messages)
-                    elif isinstance(interval_messages, str):
-                        message_to_say = interval_messages
+                if active_audio_thread and not active_audio_thread.is_alive():
+                    print("Audio finished. Transitioning to COOLDOWN state.")
+                    recognition_state = 'COOLDOWN'
+                    cooldown_end_time = time.time() + match_interval
+                    active_audio_thread = None # Clear the completed thread
 
-                    if message_to_say:
-                        announcement_thread = threading.Thread(
-                            target=_play_audio_threaded,
-                            args=(message_to_say, config_data, tts_client)
-                        )
-                        announcement_thread.daemon = True
-                        announcement_thread.start()
-                
-                recognition_state = 'SEARCHING'
+            elif recognition_state == 'JOKING':
+                # Wait for the joke audio to finish playing.
+                current_state_for_display = "Telling a joke..."
+                if not active_audio_thread or not active_audio_thread.is_alive():
+                    print("Joke finished. Returning to SEARCHING state.")
+                    recognition_state = 'SEARCHING'
+                    last_activity_time = time.time() # Reset the timer
+                    active_audio_thread = None
 
-        # Display the resulting image
-        cv2.imshow('Video', processed_frame)
+            elif recognition_state == 'COOLDOWN':
+                # This is now a pure "quiet time" after speaking.
+                cooldown_remaining = max(0, int(cooldown_end_time - time.time()))
+                current_state_for_display = f"Waiting... ({cooldown_remaining}s)"
 
-        # Hit 'q' on the keyboard to quit!
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+                if time.time() >= cooldown_end_time:
+                    print("Cooldown finished. Announcing and returning to search mode.")
+                    # Announce that we are searching again
+                    audio_is_possible = tts_client or args.headless
+                    if interval_messages and audio_is_possible:
+                        message_to_say = ""
+                        # If it's a list, pick a random one. If it's a string, use it directly.
+                        if isinstance(interval_messages, list) and interval_messages:
+                            message_to_say = random.choice(interval_messages)
+                        elif isinstance(interval_messages, str):
+                            message_to_say = interval_messages
+
+                        if message_to_say:
+                            announcement_thread = threading.Thread(
+                                target=_play_audio_threaded,
+                                args=(message_to_say, config_data, tts_client)
+                            )
+                            announcement_thread.daemon = True
+                            announcement_thread.start()
+                    
+                    recognition_state = 'SEARCHING'
+                    last_activity_time = time.time() # Reset the joke timer
+
+            # --- Output Handling (GUI or Stream) ---
+            # Draw state text on the frame if we are not in the SEARCHING state.
+            if current_state_for_display:
+                cv2.putText(processed_frame, current_state_for_display, (10, 40), cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 255, 255), 2)
+
+            if args.stream:
+                # Update the global frame for the streaming thread
+                with stream_lock:
+                    output_frame_for_stream = processed_frame.copy()
+
+            # Display GUI window only if not headless and not streaming
+            if not args.headless and not args.stream:
+                # Display the resulting image
+                cv2.imshow('Video', processed_frame)
+
+                # Hit 'q' on the keyboard to quit!
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received. Shutting down.")
 
     # --- Cleanup ---
     print("Cleaning up and shutting down...")
+    shutdown_event.set() # Signal all threads to exit
     video_capture.release()
-    cv2.destroyAllWindows()
+    if not args.headless and not args.stream:
+        cv2.destroyAllWindows()
     # Clean up any temp audio files that might have been orphaned if the app crashed
     for item in os.listdir('.'):
         if item.startswith(TEMP_AUDIO_FILE_PREFIX) and item.endswith(".wav"):
             os.remove(os.path.join('.', item))
 
-def _initialize_tts(config_data):
+class StreamingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(301)
+            self.send_header('Location', '/index.html')
+            self.end_headers()
+        elif self.path == '/index.html':
+            content = PAGE.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', len(content))
+            self.end_headers()
+            self.wfile.write(content)
+        elif self.path == '/stream.mjpg':
+            self.send_response(200)
+            self.send_header('Age', 0)
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.end_headers()
+            try:
+                while not shutdown_event.is_set(): # Check the shutdown flag
+                    with stream_lock:
+                        if output_frame_for_stream is None:
+                            continue
+                        # Encode the frame as JPEG
+                        ret, jpg_buffer = cv2.imencode('.jpg', output_frame_for_stream)
+                        if not ret:
+                            continue
+                        frame_bytes = jpg_buffer.tobytes()
+
+                    self.wfile.write(b'--FRAME\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', len(frame_bytes))
+                    self.end_headers()
+                    self.wfile.write(frame_bytes)
+                    self.wfile.write(b'\r\n')
+                    time.sleep(0.03) # Limit frame rate to ~30fps for the client
+            except Exception as e:
+                print(f"Removed streaming client: {e}")
+        else:
+            self.send_error(404)
+            self.end_headers()
+
+def _initialize_tts(config_data, args):
     """Helper function to set up the TTS client based on config."""
     tts_engine_choice = config_data.get("tts_engine")
     tts_client = None
+
+    # --- Offline Enforcement for Headless Mode ---
+    # If running in headless mode, we assume it's for the service and must run offline.
+    # We will not attempt to initialize the TTS client, relying solely on the pre-cached audio.
+    if args.headless:
+        print("--- Headless mode detected. Forcing offline operation. TTS client will not be initialized. ---")
+        return None, None
 
     # Only proceed if the configured engine is 'google_cloud' and the library was imported.
     if tts_engine_choice != "google_cloud" or 'texttospeech' not in globals():
@@ -878,6 +1030,19 @@ def _initialize_tts(config_data):
             tts_client = None # Ensure client is None on failure
 
     return tts_engine_choice, tts_client
+
+PAGE = """
+<html>
+<head>
+<title>Hammerhead AI Stream</title>
+</head>
+<body style="font-family: sans-serif; background-color: #222; color: #EEE;">
+<h1>Hammerhead AI - Live Stream</h1>
+<p>This is the live video feed from the facial recognition application.</p>
+<img src="stream.mjpg" width="1280" height="720" style="border: 2px solid #555;" />
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
     main()

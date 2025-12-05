@@ -1,6 +1,7 @@
 [Unit]
 Description=Hammerhead AI Facial Recognition Application
-After=network-online.target graphical.target pulseaudio.service
+# Run after network and audio are ready. No longer depends on the graphical target.
+After=network-online.target pulseaudio.service
 Wants=network-online.target pulseaudio.service
 
 [Service]
@@ -12,22 +13,22 @@ Group=mendel
 WorkingDirectory=/home/mendel/hammerhead-ai
 
 # Environment variables needed by the script
-Environment="DISPLAY=:0"
 Environment="PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"
 # This variable is needed to force the camera driver to use a pixel format
 # that OpenCV can understand, preventing V4L2 errors on startup.
 Environment="V4L2_PIXEL_FORMAT=YUYV"
 # This is the crucial variable that allows the service to find the user's
 # PulseAudio server for sound playback. 1000 is the default UID for the 'mendel' user.
+# It is still needed for audio in headless mode.
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
 
-# --- Redirect output to the main console (tty1) for live debugging ---
-StandardOutput=tty
-StandardError=tty
-TTYPath=/dev/tty1
+# Redirect output to the systemd journal. View with 'journalctl -u hammerhead-ai.service -f'
+StandardOutput=journal
+StandardError=journal
 
-ExecStart=/bin/bash /home/mendel/hammerhead-ai/start.sh
+# Execute the start script with the --headless flag
+ExecStart=/bin/bash /home/mendel/hammerhead-ai/start.sh --headless
 Restart=on-failure
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
